@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-Aztelekom IP/MPLS Core & Access L2/L3 Routing Adjacency Weather Map Generator
-=============================================================================
+L3 Topology With Draw Io And Png with BW — Desktop Application (GUI & CLI)
+==========================================================================
 Xüsusiyyətlər:
-  1. İşə düşdükdə sizdən ardıcıl olaraq soruşur:
-       - Nəticələrin saxlanacağı **Qovluğun adı** (avtomatik yaradır)
-       - **Mərkəz (Core NCS) IP-ləri** (məs: x.x.x.x, x,x,x,y)
-       - **Access (ASR 920 / 901) IP-ləri** (vergül və ya boşluqla)
-       - **SSH Login və Parol**
-  2. Yalnız sizin verdiyiniz NCS və ASR IP-lərinə **paralel (eyni anda)** qoşulur.
-  3. Qutuların içində yalnız cihazın **Hostname** və **IP** ünvanı yazılır.
-  4. **Qatlı (Layered) Düzülüş + Anti-Overlap:**
-       - Yuxarıdan aşağıya məntiqi ardıcıllıq: REMOTE CORE -> CORE NCS -> ACCESS L1 -> ACCESS L2.
-       - Qutu ölçüləri real ölçülür, cihazlar heç vaxt üst-üstə düşmür; çox cihaz olduqda
-         təbəqə sətirlərə bölünür və şəkil avtomatik böyüyür.
-       - Xətt kəsişmələri barycenter sıralaması ilə minimuma endirilir; xətt nömrələri
-         qutulara və bir-birinə toxunmur. Sağda nömrələnmiş link siyahısı verilir.
-  5. Nəticədə yüksək keyfiyyətli **PNG (`l2_weathermap.png`)** və draw.io-da redaktə olunan
-     **`l2_weathermap.drawio`** faylı verir.
+  1. **Desktop Application (Tkinter GUI):**
+       - Proqramı işə saldıqda müasir qaranlıq mövzulu (Dark Theme) Desktop pəncərəsi açılır.
+       - İstəyə görə `--cli` bayrağı ilə terminal rejimində və ya `--demo` ilə test rejimində işləyir.
+  2. **Avtomatik Subnet Ping Skaneri (`Subnet -> Ping -> SSH`):**
+       - Bir və ya bir neçə Subnet daxil edirsiniz (məs: `10.58.1.0/24, 10.58.100.0/24`).
+       - Əvvəlcə daxil edilmiş subnet(lər)in bütün IP ünvanlarını sürətli paralel ping ilə
+         yoxlayıb bitirir, yalnız ping keçən (aktiv) IP-ləri seçir.
+  3. **Eyni Cihazdakı Təkrar IP-lərin Avtomatik Ötürülməsi (`10.58.1.101` vs `10.58.100.101`):**
+       - Əgər `10.58.1.101` və `10.58.100.101` eyni cihazdadırsa, ilk olaraq `10.58.1.101`
+         IP-sinə qoşulur; qoşulma uğurlu olduqda (və ya həmin IP cihazın interfeys siyahısında
+         göründükdə) `10.58.100.101` IP-sinə ikinci dəfə qoşulmur (vaxt itkisinin qarşısını alır),
+         lakin `.100.` IP-sini həmin cihazın məlumatlarına əlavə edir ki, əsas Core NCS
+         kimi düzgün tanınsın.
+  4. **Xətt Üzərində Bandwidth (`10Gbps`, `30Gbps` və s.):**
+       - `Te` interfeysləri üçün `10Gbps`, `Gi` üçün `1Gbps`, `TF` üçün `25Gbps`, `Fo` üçün `40Gbps`, `Hu` üçün `100Gbps`.
+       - NCS-də `BE` (`Bundle-Ether`) gördükdə `show bundle bundle-ether[id]` komandası ilə
+         üzv portları (`Te0/0/0/12`, `Te0/0/0/13`, `Te0/0/0/22` və s.) tapıb sürətlərini toplayır
+         (məs: 3 x 10Gbps = `30Gbps`) və 2 cihaz arasında xəttin üzərində 1 yerdə (`Nömrə | 30Gbps`) yazır.
+  5. **Çıxış:** Yüksək keyfiyyətli **PNG (`l2_weathermap.png`)** və **draw.io (`l2_weathermap.drawio`)**.
 """
 
 import argparse
@@ -25,12 +29,17 @@ import concurrent.futures
 import getpass
 import ipaddress
 import math
+import os
+import platform
+import queue
 import re
+import subprocess
 import sys
+import threading
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -46,6 +55,19 @@ try:
     NETMIKO_AVAILABLE = True
 except ImportError:
     NETMIKO_AVAILABLE = False
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, scrolledtext, ttk
+    TK_AVAILABLE = True
+except ImportError:
+    TK_AVAILABLE = False
+
+try:
+    from PIL import Image, ImageTk
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 
 # =====================================================================
@@ -63,6 +85,173 @@ def parse_ip_list(raw_input: str) -> List[str]:
         if t and t not in ips:
             ips.append(t)
     return ips
+
+
+def expand_subnets_and_ranges(raw_subnet_input: str) -> List[str]:
+    """
+    İstifadəçinin daxil etdiyi subnet(lər)i (məs: '10.58.1.0/24', '10.58.100.0/24',
+    '10.58.1.0' -> avtomatik /24, və ya '10.58.1.1-10.58.1.50' aralığını) açıb
+    bütün host IP ünvanlarının siyahısını qaytarır.
+    Daxil edilmə sırasını qoruyur (1-ci subnetin IP-ləri əvvəl gəlir).
+    """
+    tokens = re.split(r"[,\s;]+", raw_subnet_input.strip())
+    all_ips: List[str] = []
+    seen: Set[str] = set()
+
+    for tok in tokens:
+        t = tok.strip()
+        if not t:
+            continue
+
+        # 1) IP aralığı formatı: 10.58.1.1-10.58.1.254 və ya 10.58.1.1-254
+        if "-" in t and "/" not in t:
+            parts = t.split("-", 1)
+            start_s, end_s = parts[0].strip(), parts[1].strip()
+            try:
+                start_ip = ipaddress.IPv4Address(start_s)
+                if "." not in end_s and end_s.isdigit():
+                    base_octets = start_s.split(".")[:3]
+                    end_ip = ipaddress.IPv4Address(".".join(base_octets + [end_s]))
+                else:
+                    end_ip = ipaddress.IPv4Address(end_s)
+                curr = int(start_ip)
+                last = int(end_ip)
+                if last >= curr and (last - curr) <= 65536:
+                    for val in range(curr, last + 1):
+                        ip_str = str(ipaddress.IPv4Address(val))
+                        if ip_str not in seen:
+                            seen.add(ip_str)
+                            all_ips.append(ip_str)
+                continue
+            except ValueError:
+                pass
+
+        # 2) CIDR Subnet formatı: 10.58.1.0/24 (əgər '/mask' yazılmayıbsa və '.0' ilə bitirsə -> '/24')
+        cidr_str = t
+        if "/" not in cidr_str:
+            octs = cidr_str.split(".")
+            if len(octs) == 4 and octs[3] == "0":
+                cidr_str = f"{cidr_str}/24"
+
+        if "/" in cidr_str:
+            try:
+                net = ipaddress.IPv4Network(cidr_str, strict=False)
+                hosts = list(net.hosts()) if net.num_addresses > 2 else list(net)
+                for h in hosts:
+                    ip_str = str(h)
+                    if ip_str not in seen:
+                        seen.add(ip_str)
+                        all_ips.append(ip_str)
+                continue
+            except ValueError:
+                pass
+
+        # 3) Tək IP ünvanı
+        try:
+            ipaddress.IPv4Address(t)
+            if t not in seen:
+                seen.add(t)
+                all_ips.append(t)
+        except ValueError:
+            pass
+
+    return all_ips
+
+
+def ping_single_ip(ip: str, timeout_ms: int = 750) -> bool:
+    """
+    Tək bir IP ünvanına 1 ədəd sürətli ICMP echo (ping) göndərir.
+    Həm Windows, həm də Linux/macOS üzərində işləyir.
+    """
+    is_win = platform.system().lower().startswith("win")
+    if is_win:
+        cmd = ["ping", "-n", "1", "-w", str(max(200, int(timeout_ms))), ip]
+    else:
+        wait_sec = max(1, int(math.ceil(timeout_ms / 1000.0)))
+        cmd = ["ping", "-c", "1", "-W", str(wait_sec), ip]
+
+    creationflags = 0
+    if is_win and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        creationflags = subprocess.CREATE_NO_WINDOW
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(2.0, timeout_ms / 1000.0 + 1.5),
+            creationflags=creationflags,
+        )
+        out_lower = (proc.stdout or "").lower()
+        if proc.returncode == 0 and ("ttl=" in out_lower or "bytes from" in out_lower):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def ping_sweep_ips(
+    ip_list: List[str],
+    timeout_ms: int = 750,
+    max_workers: int = 64,
+    log_fn: Optional[Callable[[str], None]] = None,
+    progress_fn: Optional[Callable[[int, int, int], None]] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> List[str]:
+    """
+    Verilmiş siyahıdakı bütün IP-ləri paralel olaraq pingləyib bitirir,
+    sonra daxil edilmə sırasını qoruyaraq yalnız ping keçən (alive) IP-ləri qaytarır.
+    """
+    total = len(ip_list)
+    if total == 0:
+        return []
+
+    if log_fn:
+        log_fn(f"[*] Ping skanı başladı: cəmi {total} IP yoxlanılır (Timeout: {timeout_ms}ms, Paralel: {max_workers})...")
+
+    alive_set: Set[str] = set()
+    completed = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_ip = {
+            executor.submit(ping_single_ip, ip, timeout_ms): ip
+            for ip in ip_list
+        }
+        for future in concurrent.futures.as_completed(future_to_ip):
+            if stop_event and stop_event.is_set():
+                break
+            ip = future_to_ip[future]
+            completed += 1
+            try:
+                is_up = future.result()
+            except Exception:
+                is_up = False
+            if is_up:
+                alive_set.add(ip)
+                if log_fn:
+                    log_fn(f"  [PING OK] {ip}")
+            if progress_fn:
+                progress_fn(completed, total, len(alive_set))
+
+    # Daxil edilmə sırasını qoruyaraq (məs: 1-ci subnetin IP-ləri əvvəl) qaytar
+    ordered_alive = [ip for ip in ip_list if ip in alive_set]
+    if log_fn:
+        log_fn(f"[+] Ping skanı bitdi: {total} IP-dən {len(ordered_alive)} ədədinə ping keçdi.")
+    return ordered_alive
+
+
+def pair_key_1_vs_100(ip_str: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Yalnız 3-cü okteti '1' və ya '100' olan (`10.58.1.101` və `10.58.100.101` kimi)
+    eyni cihaza aid IP cütlərini tanımaq üçün `(oktet1, oktet2, oktet4)` açarını qaytarır.
+    Digər fərqli alt-şəbəkələrə (məs: 10.58.2.x) toxunmur ki, bütün cihazlar tam yoxlanılsın.
+    """
+    parts = ip_str.strip().split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        if parts[2] in ("1", "100"):
+            return (parts[0], parts[1], parts[3])
+    return None
 
 
 def clean_hostname(raw_name: str) -> str:
@@ -108,6 +297,134 @@ def shorten_interface_name(intf: str) -> str:
     return short
 
 
+def single_port_speed_gbps(port_name: str) -> float:
+    """
+    Tək bir fiziki portun adından onun sürətini (Gbps ilə) müəyyən edir:
+      - Te / TenGigE / TenGigabitEthernet -> 10 Gbps
+      - Gi / GigabitEthernet              -> 1 Gbps
+      - TF / TwentyFiveGigE               -> 25 Gbps
+      - Fo / FortyGigE                    -> 40 Gbps
+      - Fi / FiftyGigE                    -> 50 Gbps
+      - Hu / HundredGigE                  -> 100 Gbps
+      - Fa / FastEthernet                 -> 0.1 Gbps
+    """
+    s = re.sub(r"\s+", "", port_name.strip()).lower()
+    if s.startswith(("te", "tengig")):
+        return 10.0
+    if s.startswith(("hu", "hundredgig")):
+        return 100.0
+    if s.startswith(("tf", "twentyfivegig")):
+        return 25.0
+    if s.startswith(("fo", "fortygig")):
+        return 40.0
+    if s.startswith(("fi", "fiftygig")):
+        return 50.0
+    if s.startswith(("gi", "gigabit")):
+        return 1.0
+    if s.startswith(("fa", "fastethernet")):
+        return 0.1
+    return 0.0
+
+
+def format_gbps(val_gbps: float) -> str:
+    """
+    Sürət dəyərini oxunaqlı mətnə çevirir (məs: 10.0 -> '10Gbps', 30.0 -> '30Gbps').
+    """
+    if val_gbps <= 0:
+        return ""
+    if val_gbps < 1.0:
+        return f"{int(round(val_gbps * 1000))}Mbps"
+    if abs(val_gbps - round(val_gbps)) < 1e-6:
+        return f"{int(round(val_gbps))}Gbps"
+    return f"{val_gbps:.1f}Gbps"
+
+
+def extract_bundle_id(intf_name: str) -> Optional[str]:
+    """
+    İnterfeys adından (məs: 'Bundle-Ether10', 'BE10.4040', 'BE3') bundle ID-ni ('10', '3') çıxarır.
+    """
+    s = shorten_interface_name(intf_name).strip()
+    m = re.match(r"^(?:BE|Bundle-Ether)\s*(\d+)(?:\.\d+)?$", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+
+def extract_port_channel_id(intf_name: str) -> Optional[str]:
+    """
+    ASR Port-channel adından (məs: 'Po1', 'Port-channel2.100') ID-ni çıxarır.
+    """
+    s = shorten_interface_name(intf_name).strip()
+    m = re.match(r"^(?:Po|Port-channel)\s*(\d+)(?:\.\d+)?$", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+
+def parse_bundle_ether_bandwidth(output: str) -> Tuple[str, List[str]]:
+    """
+    NCS `show bundle bundle-ether[bundle_id]` çıxışını təhlil edir.
+    Oradakı üzv portları (məs: Te0/0/0/12, Te0/0/0/13, Te0/0/0/22) tapır,
+    hər birinin sürətini toplayır (məs: 3 x 10Gbps = 30Gbps) və `(bw_str, member_ports)` qaytarır.
+    """
+    member_pattern = re.compile(
+        r"\b((?:Te|TenGigE|TenGigabitEthernet|Gi|GigabitEthernet|Hu|HundredGigE|"
+        r"TF|TwentyFiveGigE|Fo|FortyGigE|Fi|FiftyGigE|Fa|FastEthernet)"
+        r"\s*\d+(?:/\d+)+)\b",
+        flags=re.IGNORECASE,
+    )
+    members: List[str] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("Port", "----", "Bundle-Ether", "Status:", "Local ")):
+            continue
+        for m in member_pattern.finditer(line):
+            raw_p = re.sub(r"\s+", "", m.group(1))
+            norm_p = shorten_interface_name(raw_p)
+            # Yalnız həqiqi fiziki port formatını (məs: Te0/0/0/12) qəbul et
+            if re.match(r"^[A-Za-z]+\d+(?:/\d+)+$", norm_p):
+                if norm_p not in members:
+                    members.append(norm_p)
+
+    total_gbps = sum(single_port_speed_gbps(p) for p in members)
+    if total_gbps > 0:
+        return format_gbps(total_gbps), members
+
+    # Ehtiyat: 'Local bandwidth <effective/available>: 30000000 (30000000) kbps' sətrindən oxu
+    bw_m = re.search(r"Local bandwidth.*?(\d+)\s*\(\d+\)\s*kbps", output, flags=re.IGNORECASE)
+    if bw_m:
+        kbps = int(bw_m.group(1))
+        if kbps > 0:
+            return format_gbps(kbps / 1_000_000.0), members
+
+    return "", members
+
+
+def resolve_interface_bandwidth(
+    intf_name: str,
+    bundle_bw_map: Optional[Dict[str, str]] = None,
+) -> str:
+    """
+    İnterfeysin adını (məs: 'Te0/0/0/6.4040' -> '10Gbps', 'BE10' -> '30Gbps')
+    və ya `bundle_bw_map` cədvəlini əsas götürərək bandwidth mətnini qaytarır.
+    """
+    s = shorten_interface_name(intf_name).strip()
+    bid = extract_bundle_id(s)
+    if bid and bundle_bw_map:
+        if f"BE{bid}" in bundle_bw_map:
+            return bundle_bw_map[f"BE{bid}"]
+        if bid in bundle_bw_map:
+            return bundle_bw_map[bid]
+
+    pid = extract_port_channel_id(s)
+    if pid and bundle_bw_map:
+        if f"Po{pid}" in bundle_bw_map:
+            return bundle_bw_map[f"Po{pid}"]
+
+    spd = single_port_speed_gbps(s)
+    return format_gbps(spd)
+
+
 def get_subnet_30_key(ip_str: str) -> str:
     """
     P2P OSPF linkinin hər iki tərəfini eyni link kimi tanımaq üçün /30 şəbəkə ünvanını qaytarır.
@@ -119,56 +436,146 @@ def get_subnet_30_key(ip_str: str) -> str:
         return ip_str
 
 
+def is_clean_hostname(name: str) -> bool:
+    """
+    IS-IS System ID-nin oxunaqlı cihaz adı (məs: 'Ganja-NCS5508') yoxsa
+    rəqəmsal NSAP/MAC formatı (məs: '0100.5400.0089' və ya IP) olduğunu yoxlayır.
+    """
+    s = name.strip()
+    if not s:
+        return False
+    if re.match(r"^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$", s):
+        return False
+    if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", s):
+        return False
+    return any(ch.isalpha() for ch in s)
+
+
 def parse_isis_adjacency(output: str) -> List[Dict[str, str]]:
     """
-    Cisco IOS-XR (`show isis adjacency`) və IOS-XE (`show isis neighbors`) çıxışını emal edir.
+    Cisco IOS-XR (`show isis adjacency detail` / `show isis adjacency`) və
+    IOS-XE (`show isis neighbors detail` / `show isis neighbors`) çıxışını emal edir.
+    Həm brief sətirlərdən, həm də altdakı `Neighbor IPv4 Address:` / `IP Address:`
+    detal sətirlərindən qonşunun IP ünvanını (`neighbor_ip`) çıxarır.
     """
-    adjacencies = []
+    adjacencies: List[Dict[str, str]] = []
+    current_adj: Optional[Dict[str, str]] = None
+
+    intf_prefix = (
+        r"(?:Te|TenGigE|TenGigabitEthernet|Gi|GigabitEthernet|Hu|HundredGigE|"
+        r"BE|Bundle-Ether|Fo|FortyGigE|TF|TwentyFiveGigE|Fi|FiftyGigE|Fa|FastEthernet|"
+        r"Po|Port-channel|Vl|Vlan|BDI|BVI)[0-9/\.\-:]+"
+    )
+
     for raw_line in output.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith(("IS-IS", "System Id", "BFD", "Tag ", "Tue ", "Mon ", "Wed ", "Thu ", "Fri ", "Sat ", "Sun ")):
+        if not line:
             continue
+        if line.startswith(("IS-IS", "System Id", "BFD", "Tag ", "Tue ", "Mon ", "Wed ", "Thu ", "Fri ", "Sat ", "Sun ", "---")):
+            continue
+
+        # Detal sətirlərində qonşunun IP ünvanını tut (məs: 'Neighbor IPv4 Address: 10.54.1.2*' və ya 'IP Address: 10.54.1.2')
+        ip_detail_m = re.search(
+            r"(?:Neighbor\s+IPv4\s+Address|IPv4\s+Address|IP\s+Address)\s*:\s*(\d{1,3}(?:\.\d{1,3}){3})",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if ip_detail_m and current_adj is not None:
+            if not current_adj.get("neighbor_ip"):
+                current_adj["neighbor_ip"] = ip_detail_m.group(1)
+            continue
+
+        if current_adj is not None and ("Area Address" in line or "Uptime" in line or "Expires" in line):
+            up_m = re.search(r"Uptime\s*:\s*([0-9a-zA-Z:]+)", line, flags=re.IGNORECASE)
+            if up_m:
+                current_adj["uptime"] = up_m.group(1)
+            continue
+
+        # 1) IOS-XR formatı: System_Id   Interface   SNPA (*PtoP* / xxxx.xxxx.xxxx)   State   Hold   Changed ...
         match_xr = re.match(
             r"^([A-Za-z0-9_\-\.]+)\s+"
-            r"([A-Za-z0-9/\.\-:]+)\s+"
-            r"(\*PtoP\*|[0-9a-fA-F\.]+)\s+"
+            rf"({intf_prefix})\s+"
+            r"(\*PtoP\*|[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}|\S+)\s+"
             r"(Up|Init|Down|UP|INIT|DOWN)\s+"
             r"(\d+)\s+"
             r"([0-9a-zA-Z:]+)",
             line,
+            flags=re.IGNORECASE,
         )
         if match_xr:
-            sys_id, intf, snpa, state, hold, uptime = match_xr.groups()
-            adjacencies.append({
+            sys_id, intf, _snpa, state, _hold, uptime = match_xr.groups()
+            current_adj = {
                 "protocol": "IS-IS",
                 "neighbor_id": clean_hostname(sys_id),
                 "neighbor_ip": "",
                 "local_interface": intf,
                 "state": state.capitalize(),
                 "uptime": uptime,
-            })
+            }
+            adjacencies.append(current_adj)
             continue
 
-        match_xe = re.match(
+        # 2) IOS-XE formatı A: System_Id   Type (L1/L2/L1L2)   Interface   IP_Address   State   Holdtime ...
+        match_xe_a = re.match(
             r"^([A-Za-z0-9_\-\.]+)\s+"
-            r"(L1|L2|L1L2)\s+"
-            r"([A-Za-z0-9/\.\-:]+)\s+"
+            r"(L1/L2|L1L2|L1/2|L1|L2)\s+"
+            rf"({intf_prefix})\s+"
             r"(\d{1,3}(?:\.\d{1,3}){3})\s+"
             r"(UP|Up|INIT|Init|DOWN|Down)\s+"
-            r"(\d+)",
+            r"(\S+)",
             line,
+            flags=re.IGNORECASE,
         )
-        if match_xe:
-            sys_id, isis_type, intf, nbr_ip, state, hold = match_xe.groups()
-            adjacencies.append({
+        if match_xe_a:
+            sys_id, _isis_type, intf, nbr_ip, state, hold = match_xe_a.groups()
+            current_adj = {
                 "protocol": "IS-IS",
                 "neighbor_id": clean_hostname(sys_id),
                 "neighbor_ip": nbr_ip,
                 "local_interface": intf,
                 "state": state.capitalize(),
                 "uptime": f"Hold:{hold}s",
-            })
-    return adjacencies
+            }
+            adjacencies.append(current_adj)
+            continue
+
+        # 3) IOS-XE formatı B (Interface əvvəl, yaxud IP olmadan): System_Id   Interface   ...   State   Hold   Type
+        match_xe_b = re.match(
+            r"^([A-Za-z0-9_\-\.]+)\s+"
+            rf"({intf_prefix})\s+"
+            r"(\S+)\s+"
+            r"(UP|Up|INIT|Init|DOWN|Down)\s+"
+            r"(\S+)\s+"
+            r"(L1/L2|L1L2|L1/2|L1|L2)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match_xe_b:
+            sys_id, intf, snpa_or_ip, state, hold, _tp = match_xe_b.groups()
+            nbr_ip = snpa_or_ip if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", snpa_or_ip) else ""
+            current_adj = {
+                "protocol": "IS-IS",
+                "neighbor_id": clean_hostname(sys_id),
+                "neighbor_ip": nbr_ip,
+                "local_interface": intf,
+                "state": state.capitalize(),
+                "uptime": f"Hold:{hold}s",
+            }
+            adjacencies.append(current_adj)
+            continue
+
+    # Eyni (neighbor_id, local_interface) təkrarlarını birləşdir (detal və brief birlikdə oxunduqda)
+    merged: List[Dict[str, str]] = []
+    seen_keys: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for a in adjacencies:
+        k = (a["neighbor_id"], shorten_interface_name(a["local_interface"]))
+        if k not in seen_keys:
+            seen_keys[k] = a
+            merged.append(a)
+        else:
+            if not seen_keys[k].get("neighbor_ip") and a.get("neighbor_ip"):
+                seen_keys[k]["neighbor_ip"] = a["neighbor_ip"]
+    return merged
 
 
 def parse_ospf_neighbors(output: str) -> List[Dict[str, str]]:
@@ -234,17 +641,26 @@ def poll_single_device(
     ip: str,
     username: str,
     password: str,
-    is_ncs: bool,
+    is_ncs: Optional[bool] = None,
     timeout: int = 10,
+    log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[Dict]:
     """
     Verilmiş tək bir IP-yə (NCS və ya ASR) qoşulub Hostname, Lokal IP-lər,
-    IS-IS və OSPF qonşuluqlarını sürətlə götürür.
+    IS-IS, OSPF qonşuluqlarını və Bundle-Ether sürətlərini tam çıxarır.
     """
     if not NETMIKO_AVAILABLE:
         raise RuntimeError("Netmiko kitabxanası tapılmadı. Yükləmək üçün: pip install netmiko")
 
-    device_types = ["cisco_xr", "cisco_xe"] if is_ncs else ["cisco_ios", "cisco_xe", "cisco_xr"]
+    if is_ncs is True:
+        device_types = ["cisco_xr", "cisco_xe"]
+    elif is_ncs is False:
+        device_types = ["cisco_ios", "cisco_xe", "cisco_xr"]
+    else:
+        if has_100_in_third_octet([ip]):
+            device_types = ["cisco_xr", "cisco_xe", "cisco_ios"]
+        else:
+            device_types = ["cisco_xe", "cisco_ios", "cisco_xr"]
 
     for dev_type in device_types:
         params = {
@@ -278,8 +694,12 @@ def poll_single_device(
                         hostname = clean_hostname(h_match.group(1))
 
                 if is_xr_prompt:
-                    ip_brief = conn.send_command("show ipv4 interface brief")
-                    isis_out = conn.send_command("show isis adjacency")
+                    ip_brief = conn.send_command("show ipv4 vrf all interface brief")
+                    if "Invalid" in ip_brief or not ip_brief.strip():
+                        ip_brief = conn.send_command("show ipv4 interface brief")
+                    isis_out = conn.send_command("show isis adjacency detail")
+                    if "Invalid" in isis_out or not isis_out.strip():
+                        isis_out = conn.send_command("show isis adjacency")
                     ospf_out = conn.send_command("show ospf neighbor")
                     if "Invalid" in ospf_out or not ospf_out.strip():
                         ospf_out = conn.send_command("show ip ospf neighbor")
@@ -290,36 +710,86 @@ def poll_single_device(
                     ospf_out = conn.send_command("show ip ospf neighbor")
                     if "Invalid" in ospf_out or not ospf_out.strip():
                         ospf_out = conn.send_command("show ospf neighbor")
-                    isis_out = conn.send_command("show isis neighbors")
+                    isis_out = conn.send_command("show isis neighbors detail")
+                    isis_brief = conn.send_command("show isis neighbors")
+                    if "Invalid" not in isis_brief and isis_brief.strip():
+                        isis_out = isis_brief + "\n" + isis_out
                     if "Invalid" in isis_out or not isis_out.strip():
-                        isis_out = conn.send_command("show isis adjacency")
+                        isis_out = conn.send_command("show isis adjacency detail")
 
                 local_ips = parse_local_ips(ip_brief)
                 local_ips.add(ip)
                 isis_neighbors = parse_isis_adjacency(isis_out)
                 ospf_neighbors = parse_ospf_neighbors(ospf_out)
 
-                actual_os = "cisco_xr" if (is_xr_prompt or is_ncs or "NCS" in hostname.upper()) else "cisco_xe"
-                print(
-                    f"  [OK] {hostname} ({ip}) | "
+                detected_ncs = bool(is_xr_prompt or (is_ncs is True) or ("NCS" in hostname.upper()))
+
+                bundle_bw_map: Dict[str, str] = {}
+                bundle_members_map: Dict[str, List[str]] = {}
+                all_adj_intfs = [a["local_interface"] for a in isis_neighbors] + [n["local_interface"] for n in ospf_neighbors]
+
+                if detected_ncs:
+                    seen_bids: Set[str] = set()
+                    for raw_intf in all_adj_intfs:
+                        bid = extract_bundle_id(raw_intf)
+                        if bid and bid not in seen_bids:
+                            seen_bids.add(bid)
+                            b_out = conn.send_command(f"show bundle bundle-ether{bid}")
+                            if "Invalid" in b_out or not b_out.strip():
+                                b_out = conn.send_command(f"show bundle Bundle-Ether {bid}")
+                            bw_str, members = parse_bundle_ether_bandwidth(b_out)
+                            if bw_str:
+                                bundle_bw_map[f"BE{bid}"] = bw_str
+                                bundle_members_map[f"BE{bid}"] = members
+                else:
+                    seen_pids: Set[str] = set()
+                    for raw_intf in all_adj_intfs:
+                        pid = extract_port_channel_id(raw_intf)
+                        if pid and pid not in seen_pids:
+                            seen_pids.add(pid)
+                            po_out = conn.send_command(f"show etherchannel {pid} summary")
+                            if po_out and "Invalid" not in po_out:
+                                bw_str, members = parse_bundle_ether_bandwidth(po_out)
+                                if bw_str:
+                                    bundle_bw_map[f"Po{pid}"] = bw_str
+                                    bundle_members_map[f"Po{pid}"] = members
+
+                actual_os = "cisco_xr" if detected_ncs else "cisco_xe"
+                msg = (
+                    f"  [OK] {hostname} ({ip}, {'NCS' if detected_ncs else 'ASR'}) | "
                     f"IS-IS qonşu: {len(isis_neighbors)}, OSPF qonşu: {len(ospf_neighbors)}"
                 )
+                if bundle_bw_map:
+                    bw_summary = ", ".join(f"{k}={v}" for k, v in bundle_bw_map.items())
+                    msg += f" | Bundle BW: {bw_summary}"
+                print(msg)
+                if log_fn:
+                    log_fn(msg)
+
                 return {
                     "hostname": hostname,
                     "mgmt_ip": ip,
-                    "is_ncs": is_ncs or ("NCS" in hostname.upper()) or is_xr_prompt,
+                    "is_ncs": detected_ncs,
                     "device_type": actual_os,
                     "local_ips": sorted(local_ips),
                     "isis_neighbors": isis_neighbors,
                     "ospf_neighbors": ospf_neighbors,
+                    "bundle_bw_map": bundle_bw_map,
+                    "bundle_members_map": bundle_members_map,
                 }
         except NetmikoAuthenticationException:
-            print(f"  [!] Autentifikasiya xətası ({ip}): Login və ya parol yanlışdır.")
+            err_msg = f"  [!] Autentifikasiya xətası ({ip}): Login və ya parol yanlışdır."
+            print(err_msg)
+            if log_fn:
+                log_fn(err_msg)
             return None
         except (NetmikoTimeoutException, Exception):
             continue
 
-    print(f"  [X] Cihaza qoşulmaq mümkün olmadı: {ip}")
+    fail_msg = f"  [X] Cihaza qoşulmaq mümkün olmadı: {ip}"
+    print(fail_msg)
+    if log_fn:
+        log_fn(fail_msg)
     return None
 
 
@@ -329,16 +799,28 @@ def collect_all_devices_parallel(
     username: str,
     password: str,
     max_workers: int = 10,
+    auto_ips: Optional[List[str]] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+    progress_fn: Optional[Callable[[int, int], None]] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> Tuple[Dict[str, Dict], Dict[str, str], Set[str]]:
     """
-    İstifadəçinin verdiyi bütün NCS və ASR IP-lərinə paralel (eyni anda) qoşulur.
+    Ping testinin nəticəsində tapılan (və əl ilə verilən) BÜTÜN IP-lərə daxil olur.
+    Əgər iki fərqli IP-də (məs: 10.58.1.101 və 10.58.100.101) `hostname` EYNİ çıxarsa,
+    onları eyni cihaz kimi birləşdirir (bütün qonşularını və lokal IP-lərini saxlayır).
     """
     discovered_devices: Dict[str, Dict] = {}
     ip_to_host: Dict[str, str] = {}
     ncs_hosts: Set[str] = set()
 
-    tasks: List[Tuple[str, bool]] = []
+    tasks: List[Tuple[str, Optional[bool]]] = []
     seen_input_ips: Set[str] = set()
+
+    for ip in (auto_ips or []):
+        if ip not in seen_input_ips:
+            seen_input_ips.add(ip)
+            tasks.append((ip, None))
+
     for ip in ncs_ips:
         if ip not in seen_input_ips:
             seen_input_ips.add(ip)
@@ -348,43 +830,82 @@ def collect_all_devices_parallel(
             seen_input_ips.add(ip)
             tasks.append((ip, False))
 
-    print(f"\n[*] Cəmi {len(tasks)} cihaza ({len(ncs_ips)} NCS, {len(asr_ips)} ASR) paralel qoşulma başladı...")
+    total_candidates = len(tasks)
+    start_msg = f"\n[*] Cəmi {total_candidates} IP-yə paralel SSH qoşulma başladı (eyni Hostname olanlar birləşdiriləcək)..."
+    print(start_msg)
+    if log_fn:
+        log_fn(start_msg)
+
+    completed_count = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(poll_single_device, ip, username, password, is_ncs): (ip, is_ncs)
+            executor.submit(poll_single_device, ip, username, password, is_ncs, 10, log_fn): (ip, is_ncs)
             for ip, is_ncs in tasks
         }
         for future in concurrent.futures.as_completed(future_map):
-            ip, is_ncs = future_map[future]
+            if stop_event and stop_event.is_set():
+                break
+            ip, _is_ncs = future_map[future]
+            completed_count += 1
             try:
                 dev_info = future.result()
             except Exception as exc:
-                print(f"  [!] Xəta ({ip}): {exc}")
-                continue
+                err_m = f"  [!] Xəta ({ip}): {exc}"
+                print(err_m)
+                if log_fn:
+                    log_fn(err_m)
+                dev_info = None
 
-            if not dev_info:
-                continue
+            if dev_info:
+                hostname = dev_info["hostname"]
+                if dev_info["is_ncs"]:
+                    ncs_hosts.add(hostname)
 
-            hostname = dev_info["hostname"]
-            if dev_info["is_ncs"]:
-                ncs_hosts.add(hostname)
+                for lip in dev_info["local_ips"]:
+                    ip_to_host[lip] = hostname
 
-            for lip in dev_info["local_ips"]:
-                ip_to_host[lip] = hostname
+                if hostname in discovered_devices:
+                    existing = discovered_devices[hostname]
+                    prev_ip = existing["mgmt_ip"]
+                    dup_msg = f"  [EYNİ HOSTNAME BİRLƏŞDİRİLDİ] '{hostname}': {ip} və {prev_ip} eyni cihazdır."
+                    print(dup_msg)
+                    if log_fn:
+                        log_fn(dup_msg)
 
-            if hostname in discovered_devices:
-                existing = discovered_devices[hostname]
-                existing["local_ips"] = sorted(set(existing["local_ips"]) | set(dev_info["local_ips"]))
-            else:
-                discovered_devices[hostname] = dev_info
+                    existing["local_ips"] = sorted(set(existing["local_ips"]) | set(dev_info["local_ips"]))
+                    # Əgər yeni IP `.100.` oktetlidirsə və əvvəlki deyildirsə, mgmt_ip kimi saxla
+                    if has_100_in_third_octet([ip]) and not has_100_in_third_octet([prev_ip]):
+                        existing["mgmt_ip"] = ip
+
+                    # Qonşu siyahılarını təkrarsız birləşdir
+                    existing_isis_keys = {(a["neighbor_id"], shorten_interface_name(a["local_interface"])) for a in existing["isis_neighbors"]}
+                    for adj in dev_info["isis_neighbors"]:
+                        k = (adj["neighbor_id"], shorten_interface_name(adj["local_interface"]))
+                        if k not in existing_isis_keys:
+                            existing_isis_keys.add(k)
+                            existing["isis_neighbors"].append(adj)
+
+                    existing_ospf_keys = {(n["neighbor_id"], n["neighbor_ip"], shorten_interface_name(n["local_interface"])) for n in existing["ospf_neighbors"]}
+                    for nbr in dev_info["ospf_neighbors"]:
+                        k = (nbr["neighbor_id"], nbr["neighbor_ip"], shorten_interface_name(nbr["local_interface"]))
+                        if k not in existing_ospf_keys:
+                            existing_ospf_keys.add(k)
+                            existing["ospf_neighbors"].append(nbr)
+
+                    existing.get("bundle_bw_map", {}).update(dev_info.get("bundle_bw_map", {}))
+                    existing.get("bundle_members_map", {}).update(dev_info.get("bundle_members_map", {}))
+                    if dev_info["is_ncs"]:
+                        existing["is_ncs"] = True
+                        existing["device_type"] = "cisco_xr"
+                else:
+                    discovered_devices[hostname] = dev_info
+
+            if progress_fn:
+                progress_fn(completed_count, total_candidates)
 
     return discovered_devices, ip_to_host, ncs_hosts
 
-
-# =====================================================================
-# 3. TOPOLOGİYANIN QURULMASI (YALNIZ HOSTNAME VƏ IP İLƏ)
-# =====================================================================
 
 def resolve_neighbor_hostname(
     nbr_id: str,
@@ -393,7 +914,7 @@ def resolve_neighbor_hostname(
     current_host: str,
 ) -> Optional[str]:
     """
-    OSPF qonşusunun `Neighbor ID` (RID) və ya `Address` (P2P IP) dəyərinə görə
+    Qonşunun `Neighbor ID` (RID / System ID) və ya `Address` (P2P IP) dəyərinə görə
     onun artıq daxil olduğumuz hansısa NCS və ya ASR cihazı olub-olmadığını tapır.
     """
     if nbr_id in ip_to_host and ip_to_host[nbr_id] != current_host:
@@ -410,7 +931,11 @@ def build_unified_topology(
 ) -> Tuple[Dict[str, Dict], List[Dict]]:
     """
     Toplanmış NCS və ASR məlumatlarından vahid, təkrarsız topologiya qurur.
-    Qutuların üzərində yalnız Hostname və IP saxlanılır.
+    Əvvəlki dəqiq struktur qorunur:
+      - REMOTE CORE (tier 0): Xarici / IP-si verilməmiş IS-IS qonşuları (ad olmasa belə IP yazılır)
+      - CORE NCS (tier 1, 2): Mərkəz NCS cihazları (.100. olan 1-ci dərəcəli, digəri 2-ci dərəcəli)
+      - ACCESS L1 (tier 3): Birbaşa NCS-ə qoşulan ASR cihazları
+      - ACCESS L2 (tier 4): Başqa ASR üzərindən qoşulan 2-ci dərəcəli ASR cihazları
     """
     nodes: Dict[str, Dict] = {}
     links: List[Dict] = []
@@ -444,14 +969,22 @@ def build_unified_topology(
 
     # IS-IS Linklərinin Birləşdirilməsi
     processed_isis_pairs: Set[Tuple[str, str]] = set()
+    directly_connected_to_ncs: Set[str] = set()
 
     for host_a, dev_a in discovered_devices.items():
         isis_by_nbr: Dict[str, List[Dict]] = defaultdict(list)
         for adj in dev_a["isis_neighbors"]:
             nbr_name = clean_hostname(adj["neighbor_id"])
-            if adj.get("neighbor_ip") and adj["neighbor_ip"] in ip_to_host:
-                nbr_name = ip_to_host[adj["neighbor_ip"]]
-            isis_by_nbr[nbr_name].append(adj)
+            nbr_ip = adj.get("neighbor_ip", "").strip()
+            if nbr_name in discovered_devices and nbr_name != host_a:
+                resolved = nbr_name
+            elif nbr_ip and nbr_ip in ip_to_host and ip_to_host[nbr_ip] != host_a:
+                resolved = ip_to_host[nbr_ip]
+            else:
+                resolved = nbr_name if is_clean_hostname(nbr_name) else (nbr_ip or nbr_name)
+            if resolved == host_a:
+                continue
+            isis_by_nbr[resolved].append(adj)
 
         for nbr_name, adj_list in isis_by_nbr.items():
             pair_key = tuple(sorted([host_a, nbr_name]))
@@ -459,37 +992,64 @@ def build_unified_topology(
                 continue
             processed_isis_pairs.add(pair_key)
 
+            nbr_ip_str = next((a.get("neighbor_ip", "") for a in adj_list if a.get("neighbor_ip")), "")
+
             if nbr_name not in nodes:
-                is_remote_core = any(k in nbr_name.upper() for k in ("NCS", "PE", "ROUTER", "MSE"))
-                nbr_ip_str = adj_list[0].get("neighbor_ip", "")
+                is_remote_core = (host_a in ncs_hosts) or any(
+                    k in nbr_name.upper() for k in ("NCS", "PE", "ROUTER", "MSE")
+                )
+                # Əgər qarşı IS-IS qonşusunun IP-si verilməyibsə: adı varsa Ad + IP, yoxdursa sadəcə IP yaz!
+                if is_clean_hostname(nbr_name) and nbr_ip_str and nbr_name != nbr_ip_str:
+                    lbl_text = f"{nbr_name}\n{nbr_ip_str}"
+                elif nbr_ip_str:
+                    lbl_text = nbr_ip_str
+                else:
+                    lbl_text = nbr_name
+
                 nodes[nbr_name] = {
                     "id": nbr_name,
-                    "label": f"{nbr_name}\n{nbr_ip_str}".strip(),
-                    "mgmt_ip": nbr_ip_str,
+                    "label": lbl_text.strip(),
+                    "mgmt_ip": nbr_ip_str or nbr_name,
                     "role": "remote_isis_core" if is_remote_core else "deg3_access",
                     "tier": 0 if is_remote_core else 3,
                     "device_type": "cisco_xr" if is_remote_core else "cisco_xe",
                     "local_ips": [nbr_ip_str] if nbr_ip_str else [],
                 }
 
+            if host_a in ncs_hosts and nodes[nbr_name]["role"] == "deg3_access":
+                directly_connected_to_ncs.add(nbr_name)
+            elif nbr_name in ncs_hosts and nodes[host_a]["role"] == "deg3_access":
+                directly_connected_to_ncs.add(host_a)
+
             reverse_intfs: List[str] = []
             if nbr_name in discovered_devices:
                 for rev_adj in discovered_devices[nbr_name]["isis_neighbors"]:
-                    if clean_hostname(rev_adj["neighbor_id"]) == host_a:
+                    rev_id = clean_hostname(rev_adj["neighbor_id"])
+                    rev_ip = rev_adj.get("neighbor_ip", "")
+                    if rev_id == host_a or (rev_ip and ip_to_host.get(rev_ip) == host_a):
                         reverse_intfs.append(shorten_interface_name(rev_adj["local_interface"]))
+
+            bw_map_a = dev_a.get("bundle_bw_map", {})
+            bw_map_b = discovered_devices.get(nbr_name, {}).get("bundle_bw_map", {})
 
             for idx, adj in enumerate(adj_list):
                 intf_a = shorten_interface_name(adj["local_interface"])
-                if idx < len(reverse_intfs) and reverse_intfs[idx] != intf_a:
-                    intf_label = f"{intf_a} ↔ {reverse_intfs[idx]}"
+                intf_b = reverse_intfs[idx] if idx < len(reverse_intfs) else ""
+                if intf_b and intf_b != intf_a:
+                    intf_label = f"{intf_a} ↔ {intf_b}"
                 else:
                     intf_label = intf_a
+
+                bw_str = resolve_interface_bandwidth(intf_a, bw_map_a)
+                if not bw_str and intf_b:
+                    bw_str = resolve_interface_bandwidth(intf_b, bw_map_b)
 
                 links.append({
                     "source": host_a,
                     "target": nbr_name,
                     "protocol": "IS-IS",
                     "local_interface": intf_label,
+                    "bandwidth": bw_str,
                     "neighbor_ip": adj.get("neighbor_ip") or "P2P",
                     "p2p_ip": adj.get("neighbor_ip", ""),
                     "state": adj["state"],
@@ -498,7 +1058,6 @@ def build_unified_topology(
 
     # OSPF Linklərinin Birləşdirilməsi
     seen_ospf_links: Dict[Tuple[str, str, str], Dict] = {}
-    directly_connected_to_ncs: Set[str] = set()
 
     for host_a, dev_a in discovered_devices.items():
         for nbr in dev_a["ospf_neighbors"]:
@@ -535,6 +1094,7 @@ def build_unified_topology(
 
             pair = tuple(sorted([host_a, host_b]))
             dedup_key = (pair[0], pair[1], subnet_key)
+            bw_a = resolve_interface_bandwidth(intf_a, dev_a.get("bundle_bw_map", {}))
 
             if dedup_key not in seen_ospf_links:
                 link_obj = {
@@ -542,6 +1102,7 @@ def build_unified_topology(
                     "target": host_b,
                     "protocol": "OSPF",
                     "local_interface": intf_a,
+                    "bandwidth": bw_a,
                     "intf_by_host": {host_a: intf_a},
                     "neighbor_ip": f"RID: {nbr_id} | P2P: {nbr_ip}",
                     "p2p_ip": nbr_ip,
@@ -553,13 +1114,17 @@ def build_unified_topology(
             else:
                 existing = seen_ospf_links[dedup_key]
                 existing["intf_by_host"][host_a] = intf_a
+                if not existing.get("bandwidth") and bw_a:
+                    existing["bandwidth"] = bw_a
+                elif bw_a and intf_a.upper().startswith("BE"):
+                    existing["bandwidth"] = bw_a
                 if len(existing["intf_by_host"]) == 2:
                     h1, h2 = existing["source"], existing["target"]
                     i1 = existing["intf_by_host"].get(h1, "")
                     i2 = existing["intf_by_host"].get(h2, "")
                     existing["local_interface"] = f"{i1} ↔ {i2}" if i1 != i2 else i1
 
-    # Əgər ASR birbaşa NCS-ə deyil, başqa ASR-in üzərindən 2-ci OSPF qonşusu kimi çıxıbsa, tier=4 et
+    # Əgər ASR birbaşa NCS-ə deyil, başqa ASR-in üzərindən 2-ci OSPF/IS-IS qonşusu kimi çıxıbsa, tier=4 et
     for nid, n in nodes.items():
         if n["role"] == "deg3_access" and n["tier"] == 3:
             if nid not in directly_connected_to_ncs:
@@ -579,28 +1144,17 @@ def build_unified_topology(
     return nodes, links
 
 
-
 # =====================================================================
-# 4. QATLI (LAYERED) DÜZÜLÜŞ, ANTI-OVERLAP VƏ XƏTT MARŞRUTLAMASI
+# 4. GENİŞ QATLI (LAYERED) DÜZÜLÜŞ VƏ KƏSİŞMƏSİZ ORTOQONAL MARŞRUTLAMA
 # =====================================================================
-#   Məntiq (yuxarıdan aşağıya):
-#       REMOTE CORE  ->  CORE NCS  ->  ACCESS L1  ->  ACCESS L2 ...
-#   - Hər təbəqə ayrıca üfüqi zolaqdır (solda adı yazılır).
-#   - Qutu ölçüləri matplotlib ilə REAL ölçülür -> qutular heç vaxt üst-üstə düşmür.
-#   - Təbəqədə cihaz çox olduqda, sətirlərə bölünür (zigzaq/staggered), şəkil böyüyür.
-#   - Təbəqə daxilində sıralama barycenter üsulu ilə aparılır (xətt kəsişmələri minimuma enir).
-#   - Eyni düzülüş .drawio (redaktə olunan) faylı kimi də yazılır.
-#   - Mgmt IP-sinin ilk 2 oktetı eyni olan cihazlar təbəqədə yan-yana saxlanılır.
-#   - Xətlər ortoqonaldır (yumru künclü): hər xəttin öz portu və öz zolağı var,
-#     iki xətt heç vaxt eyni koordinatı paylaşmır (üst-üstə düşmə = 0).
 
-INCH_PER_UNIT = 0.30   # 1 koordinat vahidi = 0.30 düym (qutu ölçüləri ilə uyğun)
-H_GAP = 3.6            # eyni sətirdə qutular arası üfüqi boşluq
-V_GAP = 2.6            # eyni təbəqənin sətirləri arası şaquli boşluq
-LAYER_GAP = 4.2        # təbəqələr arası şaquli boşluq (xətt və nömrələr üçün)
-LANE_STEP = 0.5        # paralel üfüqi zolaqlar (lane) arası məsafə
-PORT_SP = 0.30         # eyni kanalda iki şaquli xətt arası minimum məsafə
-MAX_COLS = 8           # bir sətirdə maksimum cihaz (çox olduqda sətirlərə bölünür)
+INCH_PER_UNIT = 0.30   # 1 koordinat vahidi = 0.30 düym
+H_GAP = 5.4            # eyni sətirdə qutular arası GENİŞ üfüqi boşluq (xətlərin rahat keçməsi üçün)
+V_GAP = 4.6            # eyni təbəqənin alt-sətirləri arası şaquli boşluq
+LAYER_GAP = 6.2        # təbəqələr arası GENİŞ şaquli boşluq (ortoqonal xətlər və BW nişanları üçün)
+LANE_STEP = 0.82       # paralel üfüqi xətt zolaqları (lane) arası geniş məsafə
+PORT_SP = 0.68         # şaquli xətlər və portlar arası minimum məsafə (üst-üstə düşmə = 0)
+MAX_COLS = 60          # bir sətirdə maksimum cihaz (geniş topologiya üçün 16 sütun)
 
 
 def node_style(n: Dict) -> Dict:
@@ -616,14 +1170,12 @@ def node_style(n: Dict) -> Dict:
 
 
 def estimate_box_size(label: str) -> Tuple[float, float]:
-    """Ehtiyat (fallback) ölçü hesablaması."""
     lines = label.splitlines() or [label]
     max_chars = max(len(line) for line in lines)
-    return max(5.2, max_chars * 0.31 + 1.4), max(1.9, len(lines) * 0.82 + 0.7)
+    return max(5.4, max_chars * 0.32 + 1.5), max(2.0, len(lines) * 0.84 + 0.75)
 
 
 def measure_box_sizes(nodes: Dict[str, Dict]) -> Dict[str, Tuple[float, float]]:
-    """Hər qutunun REAL en/hündürlüyünü (koordinat vahidi ilə) matplotlib-dən ölçür."""
     sizes: Dict[str, Tuple[float, float]] = {}
     try:
         fig = plt.figure(figsize=(4, 4), dpi=100)
@@ -633,10 +1185,10 @@ def measure_box_sizes(nodes: Dict[str, Dict]) -> Dict[str, Tuple[float, float]]:
             fs = st["font_sz"]
             t = fig.text(0, 0, n["label"], fontsize=fs, fontweight="bold", fontfamily="DejaVu Sans")
             bb = t.get_window_extent(renderer)
-            pad_in = 0.55 * fs / 72.0
+            pad_in = 0.58 * fs / 72.0
             border_in = st["border_w"] / 72.0
-            w_in = bb.width / fig.dpi + 2 * pad_in + border_in + 0.06
-            h_in = bb.height / fig.dpi + 2 * pad_in + border_in + 0.06
+            w_in = bb.width / fig.dpi + 2 * pad_in + border_in + 0.08
+            h_in = bb.height / fig.dpi + 2 * pad_in + border_in + 0.08
             sizes[nid] = (w_in / INCH_PER_UNIT, h_in / INCH_PER_UNIT)
         plt.close(fig)
     except Exception:
@@ -645,7 +1197,7 @@ def measure_box_sizes(nodes: Dict[str, Dict]) -> Dict[str, Tuple[float, float]]:
 
 
 def widen_for_ports(nodes, links, sizes):
-    """Linki çox olan cihazın qutusunu enləndirir ki, bütün xətlər qutunun kənarında ayrı port tapsın."""
+    """Linki çox olan cihazın qutusunu enləndirir ki, hər port arasında ən azı 0.75 vahid məsafə olsun."""
     lv = {nid: _layer_value(n) for nid, n in nodes.items()}
     up: Dict[str, int] = defaultdict(int)
     down: Dict[str, int] = defaultdict(int)
@@ -664,17 +1216,15 @@ def widen_for_ports(nodes, links, sizes):
             up[a] += 1
     out: Dict[str, Tuple[float, float]] = {}
     for nid, (w, h) in sizes.items():
-        need = 0.40 * max(up[nid], down[nid]) / 0.92
+        need = 0.78 * max(up[nid], down[nid]) / 0.88
         out[nid] = (max(w, need), h)
     return out
 
 
 def _isotonic_spaced(desired: List[float], spacing: float) -> List[float]:
-    """
-    Sıranı pozmadan, qonşular arası məsafə >= spacing olmaqla, 'desired' mövqelərinə
-    ən yaxın koordinatları tapır (Pool-Adjacent-Violators). Üst-üstə düşmə = 0.
-    """
     n = len(desired)
+    if n == 0:
+        return []
     y = [d - i * spacing for i, d in enumerate(desired)]
     blocks: List[List[float]] = []
     for v in y:
@@ -690,25 +1240,35 @@ def _isotonic_spaced(desired: List[float], spacing: float) -> List[float]:
 
 
 def _arrange_layer(order: List[str], desired: Dict[str, float], cell: float, rows: int):
-    """Təbəqəni sütunlara böl (sütun-major). Sütunlar düz şəbəkədir ki, xətlər aralarından keçə bilsin."""
-    cols = [order[i:i + rows] for i in range(0, len(order), rows)]
-    col_des = [sum(desired[v] for v in c) / len(c) for c in cols]
-    col_x = _isotonic_spaced(col_des, cell)
+    """
+    Təbəqəni sətirlərə düzür. Əgər `rows > 1` olarsa, tək və cüt alt-sətirləri
+    üfüqi olaraq `0.5 * cell` qədər sürüşdürür (staggered) ki, alt sətirdəki qutu
+    üst sətirdəki qutu ilə heç vaxt eyni X şaquli xəttinə düşməsin!
+    """
+    if rows <= 1:
+        xs_list = _isotonic_spaced([desired[v] for v in order], cell)
+        return {v: xs_list[i] for i, v in enumerate(order)}, {v: 0 for v in order}
+
     xs: Dict[str, float] = {}
     sub: Dict[str, int] = {}
-    for ci, c in enumerate(cols):
-        for r, v in enumerate(c):
-            xs[v] = col_x[ci]
+    for r in range(rows):
+        row_members = [order[i] for i in range(r, len(order), rows)]
+        if not row_members:
+            continue
+        row_des = [desired[v] for v in row_members]
+        row_x = _isotonic_spaced(row_des, cell)
+        stagger_offset = (r % 2) * (0.48 * cell)
+        for idx, v in enumerate(row_members):
+            xs[v] = row_x[idx] + stagger_offset
             sub[v] = r
     return xs, sub
 
 
 def _ip_group(n: Dict, nid: str) -> str:
-    """Cihazın mgmt IP-sinin ilk 2 oktetini qrup açarı kimi qaytarır (məs. '10.53')."""
     parts = (n.get("mgmt_ip") or "").strip().split(".")
     if len(parts) == 4 and all(p.isdigit() for p in parts):
         return ".".join(parts[:2])
-    return "?" + nid      # IP bilinmirsə cihaz tək qrupdur
+    return "?" + nid
 
 
 def _layer_value(n: Dict) -> int:
@@ -717,7 +1277,7 @@ def _layer_value(n: Dict) -> int:
         return 0
     if t in (1, 2):
         return 1
-    return t - 1          # tier3 -> 2, tier4 -> 3 ...
+    return t - 1          # tier3 -> 2 (ACCESS L1), tier4 -> 3 (ACCESS L2), tier5 -> 4 (ACCESS L3)...
 
 
 def _band_label(tiers: Set[int]) -> str:
@@ -733,13 +1293,6 @@ def compute_layer_columns(
     links: List[Dict],
     sizes: Optional[Dict[str, Tuple[float, float]]] = None,
 ):
-    """
-    Qatlı düzülüşün X hissəsi. Qaytarır: (xs, row_of, rows, layer_rows)
-      xs[nid]      - qutunun mərkəz X-i
-      row_of[nid]  - qlobal sətir nömrəsi (yuxarıdan aşağı)
-      rows[i]      - {"layer", "nodes", "h"}
-      layer_rows   - [{"label", "rows": [...]}]  (təbəqə zolaqları üçün)
-    """
     if sizes is None:
         sizes = {nid: estimate_box_size(n["label"]) for nid, n in nodes.items()}
 
@@ -750,7 +1303,7 @@ def compute_layer_columns(
         for k in keys
     ]
     layer_idx = {nid: i for i, lay in enumerate(layers) for nid in lay}
-    fixed = {i for i, k in enumerate(keys) if k == 1}   # Core təbəqəsinin sırası sabit (tier, ad)
+    fixed = {i for i, k in enumerate(keys) if k == 1}
 
     nbrs: Dict[str, Set[str]] = defaultdict(set)
     for l in links:
@@ -760,19 +1313,18 @@ def compute_layer_columns(
             nbrs[t].add(s)
 
     total = len(nodes)
-    max_cols = MAX_COLS if total <= 40 else MAX_COLS + 3
+    max_cols = MAX_COLS if total <= 48 else MAX_COLS + 4
     rows = [max(1, math.ceil(len(lay) / max_cols)) for lay in layers]
     cells = [max(sizes[v][0] for v in lay) + H_GAP for lay in layers]
 
     grp = {nid: _ip_group(n, nid) for nid, n in nodes.items()}
 
     def order_layer(lay: List[str], des: Dict[str, float]) -> List[str]:
-        """Eyni ilk-2-oktet qrupu təbəqədə bitişik qalır; qruplar və qrup daxili sıra barycenter-ə görədir."""
         acc: Dict[str, List[float]] = defaultdict(list)
         for v in lay:
             acc[grp[v]].append(des[v])
         gmean = {k: sum(x) / len(x) for k, x in acc.items()}
-        return sorted(lay, key=lambda v: (gmean[grp[v]], grp[v], des[v], xs[v], v))
+        return sorted(lay, key=lambda v: (gmean[grp[v]], grp[v], des[v], xs.get(v, 0.0), v))
 
     xs: Dict[str, float] = {}
     subs: Dict[str, int] = {}
@@ -786,7 +1338,6 @@ def compute_layer_columns(
         subs.update(s)
         layers[i] = order
 
-    # İlkin düzülüş (təbəqələr mərkəzdə)
     for i, lay in enumerate(layers):
         if i not in fixed:
             lay = sorted(lay, key=lambda v: (grp[v], v))
@@ -813,7 +1364,7 @@ def compute_layer_columns(
                 des = {v: desired_for(v, direction) for v in layers[i]}
                 order = order_layer(layers[i], des)
                 arrange(i, order, des)
-    # Son keçid: yuxarıdan aşağı, valideynlərə görə dəqiqləşdir
+
     for i in range(len(layers)):
         if i in fixed:
             continue
@@ -821,7 +1372,6 @@ def compute_layer_columns(
         order = order_layer(layers[i], des)
         arrange(i, order, des)
 
-    # Qlobal mərkəzləmə
     lo = min(xs[v] - sizes[v][0] / 2 for v in xs)
     hi = max(xs[v] + sizes[v][0] / 2 for v in xs)
     shift = (lo + hi) / 2.0
@@ -849,16 +1399,18 @@ def compute_layer_columns(
 
 def _route_edges(nodes, links, sizes, xs, row_of, rows):
     """
-    Ortoqonal marşrutlama. Hər xəttin:
-      - öz şaquli port nöqtəsi (qutunun kənarında, başqa xətlə eyni x-də deyil),
-      - öz üfüqi zolağı (lane) var -> iki xətt heç vaxt eyni koordinatı paylaşmır.
-    Qaytarır: (row_y, row_top, row_bot, paths)
+    Kəsişməsiz və üst-üstə düşməsiz Ortoqonal Marşrutlama:
+      - Hər qutunun alt və üst kənarındakı çıxış/giriş portları (`xa`, `xb`) qonşuların
+        üfüqi mövqeyinə görə ciddi sıralanır və heç vaxt pozulmur!
+      - Şaquli xətlər arasında ən azı `PORT_SP = 0.68` məsafə qorunur.
+      - Kanal daxilində üfüqi xətlər (`lanes`) bir-birindən `LANE_STEP = 0.82` məsafə ilə
+        ayrı zolaqlara düşür -> iki xətt heç vaxt üst-üstə düşmür!
     """
     nrows = len(rows)
     used: Dict[int, List[float]] = defaultdict(list)
     row_boxes = [[(xs[v], sizes[v][0]) for v in r["nodes"]] for r in rows]
 
-    def alloc(chs, desired, lo, hi, sp=PORT_SP, avoid_rows=(), span=60.0):
+    def alloc(chs, desired, lo, hi, sp=PORT_SP, avoid_rows=(), span=120.0):
         def ok(x):
             if x < lo or x > hi:
                 return False
@@ -868,13 +1420,13 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
                         return False
             for r in avoid_rows:
                 for bx, bw in row_boxes[r]:
-                    if abs(x - bx) < bw / 2.0 + 0.3:
+                    if abs(x - bx) < bw / 2.0 + 0.55:
                         return False
             return True
-        steps = int(min(span, max(hi - lo, 1.0)) / 0.1) + 2
+        steps = int(min(span, max(hi - lo, 1.0)) / 0.12) + 2
         for k in range(steps):
             for sgn in ((1, -1) if k else (1,)):
-                x = desired + sgn * k * 0.1
+                x = desired + sgn * k * 0.12
                 if ok(x):
                     for c in chs:
                         used[c].append(x)
@@ -882,16 +1434,17 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
         return None
 
     def alloc_safe(chs, desired, lo, hi, **kw):
-        for sp in (PORT_SP, 0.2, 0.12):
+        for sp in (PORT_SP, 0.45, 0.30, 0.18):
             x = alloc(chs, desired, lo, hi, sp=sp, **kw)
             if x is not None:
                 return x
-        x = min(max(desired, lo), hi)
+        # Əgər yenə tapılmasa, mövcud `used` nöqtələrindən ən uzaq nöqtəni seç
+        best_x = min(max(desired, lo), hi)
         for c in chs:
-            used[c].append(x)
-        return x
+            used[c].append(best_x)
+        return best_x
 
-    # --- Kənarların təsnifatı ---
+    # --- 1. Kənarların təsnifatı ---
     E: List[Dict] = []
     for li, l in enumerate(links):
         u, v = l["source"], l["target"]
@@ -908,7 +1461,7 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
             kind = "adj" if rv == ru + 1 else "long"
         E.append({"li": li, "a": u, "b": v, "ra": ru, "rb": rv, "kind": kind, "num": l["link_num"], "lanes": []})
 
-    # --- İstənilən port mövqeyi (qutu kənarında qonşunun x-inə görə sıralanır) ---
+    # --- 2. Qutu kənarında port mövqeləri (qonşunun X-inə görə sıralı və ayrı!) ---
     side_items: Dict[Tuple[str, str], List[Tuple[int, str, str]]] = defaultdict(list)
     for e in E:
         if e["kind"] == "side":
@@ -916,22 +1469,26 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
         sa = "top" if e["kind"] == "arc" else "bottom"
         side_items[(e["a"], sa)].append((e["li"], "a", e["b"]))
         side_items[(e["b"], "top")].append((e["li"], "b", e["a"]))
+
     desired: Dict[Tuple[int, str], float] = {}
     for (nid, side), items in side_items.items():
         items.sort(key=lambda it: (xs[it[2]], links[it[0]]["link_num"]))
         n_it = len(items)
-        step = min(1.0, 0.92 * sizes[nid][0] / n_it)
+        step = min(1.25, max(0.70, 0.88 * sizes[nid][0] / max(1, n_it)))
+        if step * (n_it - 1) > 0.90 * sizes[nid][0] and n_it > 1:
+            step = (0.90 * sizes[nid][0]) / (n_it - 1)
         for i, (li, end, _o) in enumerate(items):
             desired[(li, end)] = xs[nid] + (i - (n_it - 1) / 2.0) * step
 
-    # --- Port və koridor ayrılması ---
-    for e in sorted(E, key=lambda e: (e["rb"] - e["ra"], e["num"])):
+    # --- 3. Port və şaquli koridor ayrılması ---
+    for e in sorted(E, key=lambda e: (e["rb"] - e["ra"], abs(xs[e["a"]] - xs[e["b"]]), e["num"])):
         a, b, ra, rb, kind = e["a"], e["b"], e["ra"], e["rb"], e["kind"]
         if kind == "side":
             continue
         da, db = desired[(e["li"], "a")], desired[(e["li"], "b")]
         a_lo, a_hi = xs[a] - 0.46 * sizes[a][0], xs[a] + 0.46 * sizes[a][0]
         b_lo, b_hi = xs[b] - 0.46 * sizes[b][0], xs[b] + 0.46 * sizes[b][0]
+
         if kind == "arc":
             ch = ra - 1
             e["xa"] = alloc_safe([ch], da, a_lo, a_hi)
@@ -941,48 +1498,48 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
             ch = ra
             lo, hi = max(a_lo, b_lo), min(a_hi, b_hi)
             xm = None
-            if lo <= hi and abs(da - db) <= 1.2:
-                xm = alloc([ch], min(max((da + db) / 2.0, lo), hi), lo, hi)
+            # Yalnız 1-ə-1 tam şaquli uyğun gəldikdə və digər portlarla toqquşmadıqda düz xətt çək
+            if lo <= hi and abs(da - db) <= 0.45:
+                xm = alloc([ch], min(max((da + db) / 2.0, lo), hi), lo, hi, sp=PORT_SP)
             if xm is not None:
                 e["xa"] = e["xb"] = xm
             else:
                 e["xa"] = alloc_safe([ch], da, a_lo, a_hi)
                 e["xb"] = alloc_safe([ch], db, b_lo, b_hi)
                 e["lanes"].append((ch, e["xa"], e["xb"], "A"))
-        else:  # long
+        else:  # long (aradakı sətirlərin yanından keçən xətt)
             chs = list(range(ra, rb))
             mid_rows = list(range(ra + 1, rb))
-            xc = alloc(chs, db, -1e9, 1e9, avoid_rows=mid_rows, span=400.0)
+            preferred_xc = (da + db) / 2.0
+            xc = alloc(chs, preferred_xc, -1e9, 1e9, sp=PORT_SP, avoid_rows=mid_rows, span=500.0)
             if xc is None:
-                xc = db
-                for c in chs:
-                    used[c].append(xc)
+                xc = alloc_safe(chs, db, -1e9, 1e9, avoid_rows=mid_rows, span=500.0)
             e["xc"] = xc
-            if a_lo <= xc <= a_hi:
-                e["xa"] = xc
-            else:
-                e["xa"] = alloc_safe([ra], da, a_lo, a_hi)
+            # DİQQƏT: `xa` və `xb` HƏMİŞƏ qutunun öz sıralanmış `da`/`db` portundan çıxır!
+            e["xa"] = alloc_safe([ra], da, a_lo, a_hi)
+            if abs(e["xa"] - xc) > 0.02:
                 e["lanes"].append((ra, e["xa"], xc, "L1"))
-            if b_lo <= xc <= b_hi:
-                e["xb"] = xc
-            else:
-                e["xb"] = alloc_safe([rb - 1], db, b_lo, b_hi)
+            e["xb"] = alloc_safe([rb - 1], db, b_lo, b_hi)
+            if abs(e["xb"] - xc) > 0.02:
                 e["lanes"].append((rb - 1, xc, e["xb"], "L2"))
 
-    # --- Zolaqların (lane) paylanması: üst-üstə düşən aralıqlar fərqli zolağa düşür ---
+    # --- 4. Üfüqi zolaqların (lane) paylanması: hər kəsişən/yaxın xətt FƏRQLİ Y zolağına düşür ---
     chan_items: Dict[int, List[Tuple[float, float, Tuple[int, str]]]] = defaultdict(list)
     for e in E:
         for ch, x1, x2, tag in e["lanes"]:
             if abs(x1 - x2) > 0.01:
                 chan_items[ch].append((min(x1, x2), max(x1, x2), (e["li"], tag)))
+
     lane_idx: Dict[Tuple[int, str], int] = {}
     nlanes: Dict[int, int] = {}
     for ch, items in chan_items.items():
-        items.sort()
+        # Uzun üfüqi seqmentləri əvvəl yerləşdir ki, qısa seqmentlərlə kəsişmə az olsun
+        items.sort(key=lambda it: (it[0], -(it[1] - it[0])))
         ends: List[float] = []
         for x1, x2, key in items:
             for j, en in enumerate(ends):
-                if en + 0.4 <= x1:
+                # 1.6 vahid üfüqi təhlükəsizlik буferi (heç vaxt yaxın üfüqi xətlər eyni zolağı paylaşmır)
+                if en + 1.6 <= x1:
                     ends[j] = x2
                     lane_idx[key] = j
                     break
@@ -991,12 +1548,13 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
                 lane_idx[key] = len(ends) - 1
         nlanes[ch] = len(ends)
 
-    # --- Şaquli yerləşdirmə (kanal hündürlüyü zolaq sayına görə) ---
+    # --- 5. Şaquli yerləşdirmə (kanal hündürlüyü zolaq sayına görə avtomatik böyüyür) ---
     chan_h: Dict[int, float] = {}
     for c in range(-1, nrows - 1):
         nl = nlanes.get(c, 0)
         base = 0.0 if c == -1 else (LAYER_GAP if rows[c]["layer"] != rows[c + 1]["layer"] else V_GAP)
-        chan_h[c] = max(base, (1.8 + (nl - 1) * LANE_STEP) if nl else 0.0)
+        chan_h[c] = max(base, (2.4 + (nl - 1) * LANE_STEP) if nl else 0.0)
+
     cursor = -chan_h[-1]
     row_top: List[float] = []
     row_bot: List[float] = []
@@ -1014,9 +1572,14 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
         return row_top[0] + chan_h[-1] if c == -1 else row_bot[c]
 
     def lane_y(c: int, key: Tuple[int, str]) -> float:
-        return chan_top(c) - 0.9 - lane_idx[key] * LANE_STEP
+        nl = max(1, nlanes.get(c, 1))
+        ch_height = chan_h[c]
+        # Zolaqları kanalın mərkəzində bərabər payla
+        total_span = (nl - 1) * LANE_STEP
+        top_start = chan_top(c) - (ch_height - total_span) / 2.0
+        return top_start - lane_idx[key] * LANE_STEP
 
-    # --- Çoxbucaqlıları (polyline) qur ---
+    # --- 6. Çoxbucaqlıları (polyline) qur ---
     pair_groups: Dict[Tuple[str, str], List[Dict]] = defaultdict(list)
     for e in E:
         if e["kind"] == "side":
@@ -1025,7 +1588,7 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
     for (a, _b), grp in pair_groups.items():
         grp.sort(key=lambda e: e["num"])
         m = len(grp)
-        step = min(0.5, 0.7 * sizes[a][1] / m)
+        step = min(0.65, 0.78 * sizes[a][1] / max(1, m))
         for i, e in enumerate(grp):
             side_y[e["li"]] = ((m - 1) / 2.0 - i) * step
 
@@ -1049,14 +1612,14 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
                     pts += [(e["xa"], ly), (e["xb"], ly)]
             else:
                 xc = e["xc"]
-                if abs(e["xa"] - xc) > 0.01:
+                if abs(e["xa"] - xc) > 0.02:
                     l1 = lane_y(ra, (li, "L1"))
                     pts += [(e["xa"], l1), (xc, l1)]
-                if abs(e["xb"] - xc) > 0.01:
+                if abs(e["xb"] - xc) > 0.02:
                     l2 = lane_y(rb - 1, (li, "L2"))
                     pts += [(xc, l2), (e["xb"], l2)]
             pts.append((e["xb"], yb))
-        # təkrar və düz xətt üzərindəki artıq nöqtələri təmizlə
+
         clean = [pts[0]]
         for p in pts[1:]:
             if math.hypot(p[0] - clean[-1][0], p[1] - clean[-1][1]) > 1e-6:
@@ -1074,7 +1637,6 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
 
 
 def build_layout(nodes, links, sizes):
-    """Qaytarır: (pos, bands, paths). pos = qutu mərkəzləri, paths[link_idx] = ortoqonal nöqtələr."""
     xs, row_of, rows, layer_rows = compute_layer_columns(nodes, links, sizes)
     row_y, row_top, row_bot, paths = _route_edges(nodes, links, sizes, xs, row_of, rows)
     pos = {v: (xs[v], row_y[row_of[v]]) for v in xs}
@@ -1163,9 +1725,11 @@ def export_drawio(nodes, links, pos, sizes, paths, bands, out_path: Path) -> Non
         badge = "#FF7043" if is_isis else "#38BDF8"
         dashed = "" if link["state"].upper().startswith(("UP", "FULL")) else "dashed=1;"
         way = "".join(f'<mxPoint x="{X(p[0])}" y="{Y(p[1])}"/>' for p in pts[1:-1])
-        tip = f'{link["protocol"]} {a} <-> {b} | {link["local_interface"]} | {link["state"]} {link.get("uptime", "")}'
+        bw_val = link.get("bandwidth", "")
+        edge_label = f'{link["link_num"]} | {bw_val}' if bw_val else str(link["link_num"])
+        tip = f'{link["protocol"]} {a} <-> {b} | {link["local_interface"]} | {bw_val} | {link["state"]} {link.get("uptime", "")}'
         cells.append(
-            f'<mxCell id="e{li}" value="{link["link_num"]}" tooltip={quoteattr(tip)} edge="1" parent="1" '
+            f'<mxCell id="e{li}" value={quoteattr(edge_label)} tooltip={quoteattr(tip)} edge="1" parent="1" '
             f'source="{cell_id[s_nid]}" target="{cell_id[t_nid]}" '
             f'style="edgeStyle=none;rounded=1;html=1;endArrow=none;startArrow=none;strokeColor={color};'
             f'strokeWidth={2.8 if is_isis else 2.3};{dashed}'
@@ -1179,9 +1743,10 @@ def export_drawio(nodes, links, pos, sizes, paths, bands, out_path: Path) -> Non
     for link in links:
         src = link["source"].replace("OSPF_", "")
         dst = link["target"].replace("OSPF_", "")
+        bw_part = f' | BW: {link["bandwidth"]}' if link.get("bandwidth") else ""
         lines.append(escape(
             f'{link["link_num"]}. [{link["protocol"]}] {src} <-> {dst} | '
-            f'{shorten_interface_name(link["local_interface"])} | {link.get("p2p_ip", "")} | '
+            f'{shorten_interface_name(link["local_interface"])}{bw_part} | {link.get("p2p_ip", "")} | '
             f'{link["state"]} {link.get("uptime", "")}'
         ))
     cells.append(
@@ -1267,7 +1832,7 @@ def generate_image_weathermap(
         )
 
     # ---------------- Xətləri çək (ortoqonal, yumru künclü) ----------------
-    def rounded_path(pts, r=0.5):
+    def rounded_path(pts, r=0.28):
         verts = [pts[0]]
         codes = [MplPath.MOVETO]
         for i in range(1, len(pts) - 1):
@@ -1298,15 +1863,15 @@ def generate_image_weathermap(
             joinstyle="round",
         ))
 
-    # ---------------- Nömrə nişanları (qutulara və bir-birinə toxunmur) ----------------
+    # ---------------- Xətt üzərində Nömrə + Bandwidth nişanları (2 cihaz arasında 1 yerdə) ----------------
     placed_badges: List[Tuple[float, float]] = []
     boxes = [(pos[n][0], pos[n][1], sizes[n][0], sizes[n][1]) for n in pos]
 
     def hits_box(cx: float, cy: float) -> bool:
-        return any(abs(cx - bx) < bw / 2 + 0.65 and abs(cy - by) < bh / 2 + 0.65 for bx, by, bw, bh in boxes)
+        return any(abs(cx - bx) < bw / 2 + 1.05 and abs(cy - by) < bh / 2 + 0.65 for bx, by, bw, bh in boxes)
 
     def hits_badge(cx: float, cy: float) -> bool:
-        return any(math.hypot(cx - px, cy - py) < 1.25 for px, py in placed_badges)
+        return any(abs(cx - px) < 2.25 and abs(cy - py) < 0.95 for px, py in placed_badges)
 
     def seg_dist(px, py, p, q) -> float:
         dx, dy = q[0] - p[0], q[1] - p[1]
@@ -1321,9 +1886,9 @@ def generate_image_weathermap(
         segs = sorted(zip(pts[:-1], pts[1:]), key=lambda s: -math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1]))
         cands = []
         for p, q in segs:
-            if math.hypot(q[0] - p[0], q[1] - p[1]) < 1.0:
+            if math.hypot(q[0] - p[0], q[1] - p[1]) < 0.9:
                 continue
-            for f in (0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8):
+            for f in (0.5, 0.4, 0.6, 0.3, 0.7, 0.22, 0.78):
                 cands.append((p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f))
         if not cands:
             cands = [((pts[0][0] + pts[-1][0]) / 2.0, (pts[0][1] + pts[-1][1]) / 2.0)]
@@ -1337,15 +1902,24 @@ def generate_image_weathermap(
                 if near == 0:
                     break
         if best is None:
+            for cx, cy in cands:
+                if not hits_box(cx, cy):
+                    best = (cx, cy)
+                    break
+        if best is None:
             best = cands[0]
         placed_badges.append(best)
         is_isis = links[li]["protocol"] == "IS-IS"
+        lnum_str = str(links[li]["link_num"])
+        bw_str = links[li].get("bandwidth", "")
+        badge_text = f"{lnum_str} | {bw_str}" if bw_str else lnum_str
+        b_style = "round,pad=0.26,rounding_size=0.45" if bw_str else "circle,pad=0.32"
         ax.text(
-            best[0], best[1], str(links[li]["link_num"]),
-            fontsize=9.5, fontfamily="DejaVu Sans", fontweight="bold", color="#0B1120",
+            best[0], best[1], badge_text,
+            fontsize=8.6 if bw_str else 9.5, fontfamily="DejaVu Sans", fontweight="bold", color="#0B1120",
             ha="center", va="center", zorder=4,
-            bbox=dict(boxstyle="circle,pad=0.32", facecolor="#FF7043" if is_isis else "#38BDF8",
-                      edgecolor="#FFFFFF", linewidth=1.3),
+            bbox=dict(boxstyle=b_style, facecolor="#FF7043" if is_isis else "#38BDF8",
+                      edgecolor="#FFFFFF", linewidth=1.25),
         )
 
     # ---------------- Cihaz qutuları (Hostname + IP) ----------------
@@ -1421,13 +1995,15 @@ def generate_image_weathermap(
         p2p_ip = link.get("p2p_ip", "")
         uptime = link.get("uptime", "")
 
+        bw_str = link.get("bandwidth", "")
+        bw_part = f"   |   BW: {bw_str}" if bw_str else ""
         if is_isis:
             detail_line_1 = f"[{link['protocol']}]  {src_name}  ↔  {dst_name}"
-            detail_line_2 = f"Port: {intf_str}   |   State: {link['state']} ({uptime})"
+            detail_line_2 = f"Port: {intf_str}{bw_part}   |   State: {link['state']} ({uptime})"
         else:
             ip_part = f"IP: {p2p_ip}   |   " if p2p_ip else ""
             detail_line_1 = f"[{link['protocol']}]  {src_name}  ↔  {dst_name}"
-            detail_line_2 = f"Port: {intf_str}   |   {ip_part}Uptime: {uptime}"
+            detail_line_2 = f"Port: {intf_str}{bw_part}   |   {ip_part}Uptime: {uptime}"
 
         ax_list.text(
             x_base + 0.065, y_center, f"{lnum}", fontsize=9.0, fontweight="bold", color="#0B1120",
@@ -1450,18 +2026,1039 @@ def generate_image_weathermap(
 
 
 # =====================================================================
-# 5. DEMO REJİMİ
+# 5. DEMO REJİMİ (TE = 10Gbps VƏ BUNDLE-ETHER = 30Gbps / 20Gbps NÜMUNƏSİ)
 # =====================================================================
 
+def run_demo_mode(output_dir: Path) -> None:
+    """
+    Test məqsədilə:
+      - Mərkəz Core NCS-lər (`10.54.100.1`, `10.54.200.2`)
+      - Qarşı IP-si verilməmiş xarici IS-IS qonşusu (yalnız IP: `10.54.0.254` yazılır)
+      - `10.54.1.89` və `10.54.1.189` daxil olmaqla çoxpilləli ASR zənciri
+      - `Te` (`10Gbps`) və `Bundle-Ether` (`30Gbps`, `20Gbps`) sürətləri
+    simulyasiya edilərək geniş, kəsişməsiz PNG və draw.io çıxarır.
+    """
+    sample_be10_out = """
+    Bundle-Ether10
+      Status:                                    Up
+      Local links <active/standby/configured>:   3 / 0 / 3
+      Port                  Device           State        Port ID         B/W, kbps
+      --------------------  ---------------  -----------  --------------  ----------
+      Te0/0/0/12            Local            Active       0x8000, 0x0001    10000000
+      Te0/0/0/13            Local            Active       0x8000, 0x0002    10000000
+      Te0/0/0/22            Local            Active       0x8000, 0x0003    10000000
+    """
+    sample_be20_out = """
+    Bundle-Ether20
+      Status:                                    Up
+      Local links <active/standby/configured>:   2 / 0 / 2
+      Port                  Device           State        Port ID         B/W, kbps
+      --------------------  ---------------  -----------  --------------  ----------
+      Te0/0/0/14            Local            Active       0x8000, 0x0001    10000000
+      Te0/0/0/15            Local            Active       0x8000, 0x0002    10000000
+    """
+    bw_be10, _ = parse_bundle_ether_bandwidth(sample_be10_out)
+    bw_be20, _ = parse_bundle_ether_bandwidth(sample_be20_out)
+
+    discovered_devices = {
+        "Region-PE1-NCS55A2": {
+            "hostname": "Region-PE1-NCS55A2",
+            "mgmt_ip": "10.54.100.1",
+            "is_ncs": True,
+            "device_type": "cisco_xr",
+            "local_ips": ["10.54.100.1", "10.54.1.101", "10.54.0.1", "10.54.10.1", "10.54.11.1"],
+            "bundle_bw_map": {"BE10": bw_be10, "BE20": bw_be20},
+            "isis_neighbors": [
+                {
+                    "protocol": "IS-IS",
+                    "neighbor_id": "Region-PE2-NCS55A2",
+                    "neighbor_ip": "10.54.0.2",
+                    "local_interface": "Bundle-Ether10",
+                    "state": "Up",
+                    "uptime": "14w2d",
+                },
+                {
+                    # Qarşı tərəfin IP-si siyahıda verilməmiş IS-IS qonşusu (rəqəmsal ID -> qutuda yalnız IP yazılır)
+                    "protocol": "IS-IS",
+                    "neighbor_id": "0100.5400.0254",
+                    "neighbor_ip": "10.54.0.254",
+                    "local_interface": "Hu0/0/1/0",
+                    "state": "Up",
+                    "uptime": "28w4d",
+                },
+            ],
+            "ospf_neighbors": [
+                {
+                    "protocol": "OSPF",
+                    "neighbor_id": "10.54.1.89",
+                    "neighbor_ip": "10.54.10.2",
+                    "local_interface": "Bundle-Ether20.4040",
+                    "state": "FULL/DR",
+                    "uptime": "9w1d",
+                },
+                {
+                    "protocol": "OSPF",
+                    "neighbor_id": "10.54.1.12",
+                    "neighbor_ip": "10.54.11.2",
+                    "local_interface": "Te0/0/0/6.4041",
+                    "state": "FULL/BDR",
+                    "uptime": "6w3d",
+                },
+            ],
+        },
+        "Region-PE2-NCS55A2": {
+            "hostname": "Region-PE2-NCS55A2",
+            "mgmt_ip": "10.54.200.2",
+            "is_ncs": True,
+            "device_type": "cisco_xr",
+            "local_ips": ["10.54.200.2", "10.54.0.2", "10.54.12.1"],
+            "bundle_bw_map": {"BE10": bw_be10},
+            "isis_neighbors": [
+                {
+                    "protocol": "IS-IS",
+                    "neighbor_id": "Region-PE1-NCS55A2",
+                    "neighbor_ip": "10.54.0.1",
+                    "local_interface": "Bundle-Ether10",
+                    "state": "Up",
+                    "uptime": "14w2d",
+                },
+            ],
+            "ospf_neighbors": [
+                {
+                    "protocol": "OSPF",
+                    "neighbor_id": "10.54.1.12",
+                    "neighbor_ip": "10.54.12.2",
+                    "local_interface": "Te0/0/0/7.4042",
+                    "state": "FULL/DR",
+                    "uptime": "6w3d",
+                },
+            ],
+        },
+        "Merkez-ASR920-89": {
+            "hostname": "Merkez-ASR920-89",
+            "mgmt_ip": "10.54.1.89",
+            "is_ncs": False,
+            "device_type": "cisco_xe",
+            "local_ips": ["10.54.1.89", "10.54.10.2", "10.54.20.1", "10.54.21.1"],
+            "bundle_bw_map": {},
+            "isis_neighbors": [],
+            "ospf_neighbors": [
+                {
+                    "protocol": "OSPF",
+                    "neighbor_id": "10.54.100.1",
+                    "neighbor_ip": "10.54.10.1",
+                    "local_interface": "Po1.4040",
+                    "state": "FULL/BDR",
+                    "uptime": "9w1d",
+                },
+                {
+                    "protocol": "OSPF",
+                    "neighbor_id": "10.54.1.189",
+                    "neighbor_ip": "10.54.20.2",
+                    "local_interface": "Te0/0/24",
+                    "state": "FULL/DR",
+                    "uptime": "5w2d",
+                },
+                {
+                    "protocol": "OSPF",
+                    "neighbor_id": "10.54.1.15",
+                    "neighbor_ip": "10.54.21.2",
+                    "local_interface": "Gi0/0/15",
+                    "state": "FULL/DR",
+                    "uptime": "4w5d",
+                },
+            ],
+        },
+        "Qovsaq-ASR920-189": {
+            "hostname": "Qovsaq-ASR920-189",
+            "mgmt_ip": "10.54.1.189",
+            "is_ncs": False,
+            "device_type": "cisco_xe",
+            "local_ips": ["10.54.1.189", "10.54.20.2"],
+            "bundle_bw_map": {},
+            "isis_neighbors": [
+                {
+                    # ASR üzərində olan və IP-si siyahıda verilməmiş digər IS-IS qonşusu
+                    "protocol": "IS-IS",
+                    "neighbor_id": "0100.5400.0199",
+                    "neighbor_ip": "10.54.1.199",
+                    "local_interface": "Te0/0/25",
+                    "state": "Up",
+                    "uptime": "Hold:26s",
+                }
+            ],
+            "ospf_neighbors": [
+                {
+                    "protocol": "OSPF",
+                    "neighbor_id": "10.54.1.89",
+                    "neighbor_ip": "10.54.20.1",
+                    "local_interface": "Te0/0/24",
+                    "state": "FULL/BDR",
+                    "uptime": "5w2d",
+                },
+            ],
+        },
+        "Qerb-ASR920-12": {
+            "hostname": "Qerb-ASR920-12",
+            "mgmt_ip": "10.54.1.12",
+            "is_ncs": False,
+            "device_type": "cisco_xe",
+            "local_ips": ["10.54.1.12", "10.54.11.2", "10.54.12.2"],
+            "bundle_bw_map": {},
+            "isis_neighbors": [],
+            "ospf_neighbors": [
+                {
+                    "protocol": "OSPF",
+                    "neighbor_id": "10.54.100.1",
+                    "neighbor_ip": "10.54.11.1",
+                    "local_interface": "Te0/0/0",
+                    "state": "FULL/DR",
+                    "uptime": "6w3d",
+                },
+                {
+                    "protocol": "OSPF",
+                    "neighbor_id": "10.54.200.2",
+                    "neighbor_ip": "10.54.12.1",
+                    "local_interface": "Te0/0/1",
+                    "state": "FULL/BDR",
+                    "uptime": "6w3d",
+                },
+            ],
+        },
+        "Kend-ASR901-15": {
+            "hostname": "Kend-ASR901-15",
+            "mgmt_ip": "10.54.1.15",
+            "is_ncs": False,
+            "device_type": "cisco_xe",
+            "local_ips": ["10.54.1.15", "10.54.21.2"],
+            "bundle_bw_map": {},
+            "isis_neighbors": [],
+            "ospf_neighbors": [
+                {
+                    "protocol": "OSPF",
+                    "neighbor_id": "10.54.1.89",
+                    "neighbor_ip": "10.54.21.1",
+                    "local_interface": "Gi0/1",
+                    "state": "FULL/BDR",
+                    "uptime": "4w5d",
+                },
+            ],
+        },
+    }
+
+    ip_to_host = {}
+    for h, d in discovered_devices.items():
+        for lip in d["local_ips"]:
+            ip_to_host[lip] = h
+    ncs_hosts = {"Region-PE1-NCS55A2", "Region-PE2-NCS55A2"}
+
+    nodes, links = build_unified_topology(discovered_devices, ip_to_host, ncs_hosts)
+    generate_image_weathermap(nodes, links, output_dir / "l2_weathermap.png")
 
 
 # =====================================================================
-# 6. ƏSAS İCRA FUNKSİYASI (YALNIZ PNG ÇIXIŞI)
+# 6. DESKTOP APPLICATION (TKINTER GUI) VƏ TERMINAL (CLI) REJİMİ
 # =====================================================================
+
+class L3TopologyDesktopApp:
+    """
+    Aztelekom L2/L3 ISIS & OSPF Weather Map + Bandwidth Desktop Tətbiqi.
+    - Subnet daxiletməsi -> Bütün subnetin sürətli Ping skanı
+    - Eyni cihazdakı `1.101` və `100.101` IP-lərinin avtomatik təkrarsızlaşdırılması
+    - NCS `Bundle-Ether` (`show bundle bundle-ether[id]`) və `Te` (`10Gbps`) sürətlərinin xətt üzərində yazılması
+    - Canlı loq, proqres bar və proqram daxilində PNG topologiya önizləməsi
+    """
+
+    def __init__(self, root: "tk.Tk") -> None:
+        self.root = root
+        self.root.title("L3 Topology With Draw.io And PNG with BW — Aztelekom Desktop App")
+        self.root.geometry("1360x840")
+        self.root.minsize(1100, 700)
+        self.root.configure(bg="#0B1120")
+
+        self.log_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
+        self.stop_event = threading.Event()
+        self.worker_thread: Optional[threading.Thread] = None
+        self.last_png_path: Optional[Path] = None
+        self.last_out_dir: Optional[Path] = None
+        self._preview_photo = None
+
+        self._build_styles()
+        self._build_ui()
+        self.root.after(100, self._poll_queue)
+
+    def _build_styles(self) -> None:
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure("TFrame", background="#0B1120")
+        style.configure("Card.TFrame", background="#111B33")
+        style.configure(
+            "TLabel",
+            background="#111B33",
+            foreground="#E2E8F0",
+            font=("Segoe UI", 10),
+        )
+        style.configure(
+            "Header.TLabel",
+            background="#0B1120",
+            foreground="#F8FAFC",
+            font=("Segoe UI", 14, "bold"),
+        )
+        style.configure(
+            "SubHeader.TLabel",
+            background="#0B1120",
+            foreground="#94A3B8",
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "Section.TLabel",
+            background="#111B33",
+            foreground="#FACC15",
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.configure(
+            "TNotebook",
+            background="#0B1120",
+            borderwidth=0,
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background="#1E293B",
+            foreground="#CBD5E1",
+            padding=(14, 7),
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#0284C7")],
+            foreground=[("selected", "#FFFFFF")],
+        )
+        style.configure(
+            "Green.Horizontal.TProgressbar",
+            troughcolor="#1E293B",
+            background="#10B981",
+            bordercolor="#1E293B",
+            lightcolor="#10B981",
+            darkcolor="#10B981",
+        )
+
+    def _build_ui(self) -> None:
+        # Üst Başlıq Paneli
+        top_bar = ttk.Frame(self.root)
+        top_bar.pack(fill=tk.X, padx=16, pady=(12, 6))
+
+        title_lbl = ttk.Label(
+            top_bar,
+            text="AZTELEKOM L3 TOPOLOGY WITH DRAW.IO & PNG (WITH BANDWIDTH)",
+            style="Header.TLabel",
+        )
+        title_lbl.pack(anchor="w")
+
+        sub_lbl = ttk.Label(
+            top_bar,
+            text="Subnet Ping Skaneri  •  1.x / 100.x Eyni Cihaz Filtrləməsi  •  IS-IS & OSPF  •  Bundle-Ether / Te Sürət Hesablayıcısı",
+            style="SubHeader.TLabel",
+        )
+        sub_lbl.pack(anchor="w", pady=(2, 0))
+
+        # Əsas Gövdə (Sol: Parametrlər, Sağ: Loq & Şəkil Önizləməsi)
+        main_pane = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg="#1E293B", sashwidth=5, bd=0)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
+
+        left_frame = ttk.Frame(main_pane, style="Card.TFrame")
+        right_frame = ttk.Frame(main_pane)
+        main_pane.add(left_frame, minsize=430, width=460)
+        main_pane.add(right_frame, minsize=600)
+
+        self._build_left_controls(left_frame)
+        self._build_right_panel(right_frame)
+
+    def _build_left_controls(self, parent: "ttk.Frame") -> None:
+        pad_frame = ttk.Frame(parent, style="Card.TFrame")
+        pad_frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+
+        # 1. Çıxış Qovluğu
+        ttk.Label(pad_frame, text="1) Çıxış Qovluğu (Nəticələrin saxlanacağı yer):", style="Section.TLabel").pack(anchor="w", pady=(0, 4))
+        folder_row = ttk.Frame(pad_frame, style="Card.TFrame")
+        folder_row.pack(fill=tk.X, pady=(0, 10))
+
+        default_folder = f"Topology_{datetime.now().strftime('%Y%m%d_%H%M')}"
+        self.folder_var = tk.StringVar(value=default_folder)
+        folder_entry = tk.Entry(
+            folder_row,
+            textvariable=self.folder_var,
+            bg="#0F172A",
+            fg="#F8FAFC",
+            insertbackground="#F8FAFC",
+            relief=tk.FLAT,
+            font=("Consolas", 10),
+        )
+        folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5, padx=(0, 6))
+
+        browse_btn = tk.Button(
+            folder_row,
+            text="Qovluq Seç...",
+            command=self._choose_folder,
+            bg="#334155",
+            fg="#F8FAFC",
+            activebackground="#475569",
+            activeforeground="#FFFFFF",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        browse_btn.pack(side=tk.RIGHT)
+
+        # 2. Subnet Daxil Edin (Avtomatik Ping üçün)
+        ttk.Label(
+            pad_frame,
+            text="2) Subnet(lər) Daxil Edin (Əvvəlcə bütün IP-ləri Pingləyir):",
+            style="Section.TLabel",
+        ).pack(anchor="w", pady=(2, 2))
+        ttk.Label(
+            pad_frame,
+            text="Məs: 10.58.1.0/24, 10.58.100.0/24 (1.101 qoşulubsa 100.101 avtomatik ötürülür)",
+            foreground="#94A3B8",
+            font=("Segoe UI", 8),
+        ).pack(anchor="w", pady=(0, 4))
+
+        self.subnet_text = tk.Text(
+            pad_frame,
+            height=3,
+            bg="#0F172A",
+            fg="#38BDF8",
+            insertbackground="#F8FAFC",
+            relief=tk.FLAT,
+            font=("Consolas", 10),
+            wrap=tk.WORD,
+        )
+        self.subnet_text.pack(fill=tk.X, pady=(0, 8))
+
+        # 3. Əlavə (Əl ilə) Core NCS və Access ASR IP-ləri
+        ttk.Label(
+            pad_frame,
+            text="3) Əlavə Mərkəz (Core NCS) IP-ləri (İstəyə bağlı):",
+            style="Section.TLabel",
+        ).pack(anchor="w", pady=(2, 3))
+        self.ncs_text = tk.Text(
+            pad_frame,
+            height=2,
+            bg="#0F172A",
+            fg="#F8FAFC",
+            insertbackground="#F8FAFC",
+            relief=tk.FLAT,
+            font=("Consolas", 10),
+            wrap=tk.WORD,
+        )
+        self.ncs_text.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(
+            pad_frame,
+            text="4) Əlavə Access (ASR 920 / 901) IP-ləri (İstəyə bağlı):",
+            style="Section.TLabel",
+        ).pack(anchor="w", pady=(2, 3))
+        self.asr_text = tk.Text(
+            pad_frame,
+            height=3,
+            bg="#0F172A",
+            fg="#F8FAFC",
+            insertbackground="#F8FAFC",
+            relief=tk.FLAT,
+            font=("Consolas", 10),
+            wrap=tk.WORD,
+        )
+        self.asr_text.pack(fill=tk.X, pady=(0, 10))
+
+        # 4. SSH Məlumatları
+        ttk.Label(pad_frame, text="5) SSH Qoşulma Məlumatları:", style="Section.TLabel").pack(anchor="w", pady=(2, 4))
+        cred_grid = ttk.Frame(pad_frame, style="Card.TFrame")
+        cred_grid.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(cred_grid, text="SSH Username:").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 8))
+        self.user_var = tk.StringVar()
+        user_entry = tk.Entry(
+            cred_grid,
+            textvariable=self.user_var,
+            bg="#0F172A",
+            fg="#F8FAFC",
+            insertbackground="#F8FAFC",
+            relief=tk.FLAT,
+            font=("Consolas", 10),
+        )
+        user_entry.grid(row=0, column=1, columnspan=2, sticky="ew", ipady=4, pady=4)
+
+        ttk.Label(cred_grid, text="SSH Password:").grid(row=1, column=0, sticky="w", pady=4, padx=(0, 8))
+        self.pass_var = tk.StringVar()
+        self.pass_entry = tk.Entry(
+            cred_grid,
+            textvariable=self.pass_var,
+            show="*",
+            bg="#0F172A",
+            fg="#F8FAFC",
+            insertbackground="#F8FAFC",
+            relief=tk.FLAT,
+            font=("Consolas", 10),
+        )
+        self.pass_entry.grid(row=1, column=1, sticky="ew", ipady=4, pady=4)
+
+        self.show_pass_var = tk.BooleanVar(value=False)
+        show_cb = tk.Checkbutton(
+            cred_grid,
+            text="Göstər",
+            variable=self.show_pass_var,
+            command=self._toggle_password,
+            bg="#111B33",
+            fg="#CBD5E1",
+            selectcolor="#0F172A",
+            activebackground="#111B33",
+            activeforeground="#FFFFFF",
+            font=("Segoe UI", 8),
+        )
+        show_cb.grid(row=1, column=2, padx=(6, 0))
+        cred_grid.columnconfigure(1, weight=1)
+
+        # 5. Skan Parametrləri (Ping Timeout & Workers)
+        opt_grid = ttk.Frame(pad_frame, style="Card.TFrame")
+        opt_grid.pack(fill=tk.X, pady=(0, 12))
+
+        ttk.Label(opt_grid, text="Ping Timeout (ms):").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.ping_timeout_var = tk.StringVar(value="700")
+        tk.Entry(
+            opt_grid,
+            textvariable=self.ping_timeout_var,
+            width=8,
+            bg="#0F172A",
+            fg="#F8FAFC",
+            insertbackground="#F8FAFC",
+            relief=tk.FLAT,
+            font=("Consolas", 10),
+        ).grid(row=0, column=1, sticky="w", ipady=3, padx=(0, 16))
+
+        ttk.Label(opt_grid, text="SSH Paralel Sayı:").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.workers_var = tk.StringVar(value="12")
+        tk.Entry(
+            opt_grid,
+            textvariable=self.workers_var,
+            width=6,
+            bg="#0F172A",
+            fg="#F8FAFC",
+            insertbackground="#F8FAFC",
+            relief=tk.FLAT,
+            font=("Consolas", 10),
+        ).grid(row=0, column=3, sticky="w", ipady=3)
+
+        # 6. İdarəetmə Düymələri
+        btn_row1 = ttk.Frame(pad_frame, style="Card.TFrame")
+        btn_row1.pack(fill=tk.X, pady=(4, 6))
+
+        self.start_btn = tk.Button(
+            btn_row1,
+            text="▶  BAŞLAT (Ping + SSH + Topologiya)",
+            command=self._on_start_discovery,
+            bg="#10B981",
+            fg="#0B1120",
+            activebackground="#059669",
+            activeforeground="#FFFFFF",
+            relief=tk.FLAT,
+            font=("Segoe UI", 10, "bold"),
+            pady=8,
+            cursor="hand2",
+        )
+        self.start_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        self.stop_btn = tk.Button(
+            btn_row1,
+            text="■ Dayandır",
+            command=self._on_stop,
+            state=tk.DISABLED,
+            bg="#EF4444",
+            fg="#FFFFFF",
+            activebackground="#DC2626",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=8,
+            cursor="hand2",
+        )
+        self.stop_btn.pack(side=tk.RIGHT)
+
+        btn_row2 = ttk.Frame(pad_frame, style="Card.TFrame")
+        btn_row2.pack(fill=tk.X, pady=(2, 4))
+
+        self.ping_only_btn = tk.Button(
+            btn_row2,
+            text="🔍 Yalnız Subnet Ping Yoxla",
+            command=self._on_ping_only,
+            bg="#0284C7",
+            fg="#FFFFFF",
+            activebackground="#0369A1",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            pady=6,
+            cursor="hand2",
+        )
+        self.ping_only_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        self.demo_btn = tk.Button(
+            btn_row2,
+            text="★ Demo Topologiya Çək",
+            command=self._on_run_demo,
+            bg="#6366F1",
+            fg="#FFFFFF",
+            activebackground="#4F46E5",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            pady=6,
+            cursor="hand2",
+        )
+        self.demo_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+
+        btn_row3 = ttk.Frame(pad_frame, style="Card.TFrame")
+        btn_row3.pack(fill=tk.X, pady=(4, 0))
+
+        tk.Button(
+            btn_row3,
+            text="📂 Çıxış Qovluğunu Aç",
+            command=self._open_output_folder,
+            bg="#1E293B",
+            fg="#E2E8F0",
+            activebackground="#334155",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9),
+            pady=5,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        tk.Button(
+            btn_row3,
+            text="🖼 Şəkli Tam Ekran Aç",
+            command=self._open_image_external,
+            bg="#1E293B",
+            fg="#E2E8F0",
+            activebackground="#334155",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9),
+            pady=5,
+            cursor="hand2",
+        ).pack(side=tk.RIGHT, fill=tk.X, expand=True)
+
+    def _build_right_panel(self, parent: "ttk.Frame") -> None:
+        # Proqres və Status sətri
+        status_frame = ttk.Frame(parent, style="Card.TFrame")
+        status_frame.pack(fill=tk.X, pady=(0, 8))
+
+        self.status_var = tk.StringVar(value="Hazırdır. Subnet və ya IP-ləri daxil edib 'BAŞLAT' düyməsini sıxın.")
+        status_lbl = ttk.Label(
+            status_frame,
+            textvariable=self.status_var,
+            font=("Segoe UI", 10, "bold"),
+            foreground="#38BDF8",
+        )
+        status_lbl.pack(anchor="w", padx=10, pady=(8, 4))
+
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_bar = ttk.Progressbar(
+            status_frame,
+            variable=self.progress_var,
+            maximum=100.0,
+            style="Green.Horizontal.TProgressbar",
+        )
+        self.progress_bar.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        # Notebook (Tab 1: Canlı Loq, Tab 2: Topologiya Şəkli)
+        self.notebook = ttk.Notebook(parent)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        log_tab = ttk.Frame(self.notebook, style="Card.TFrame")
+        preview_tab = ttk.Frame(self.notebook, style="Card.TFrame")
+        self.notebook.add(log_tab, text="  📋 Canlı Sistem Loqu (Ping & SSH)  ")
+        self.notebook.add(preview_tab, text="  🗺 Topologiya Şəkli (Önizləmə)  ")
+
+        self.log_box = scrolledtext.ScrolledText(
+            log_tab,
+            bg="#090E1A",
+            fg="#E2E8F0",
+            insertbackground="#F8FAFC",
+            font=("Consolas", 10),
+            relief=tk.FLAT,
+            wrap=tk.WORD,
+        )
+        self.log_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self._append_log("=== Aztelekom L3 Topology With Draw.io & PNG (with BW) Desktop App ===")
+        self._append_log("• Subnet daxil etdikdə əvvəlcə bütün IP-lər pinglənir, yalnız cavab verənlərə SSH qoşulur.")
+        self._append_log("• Eyni cihazda həm 10.x.1.101, həm də 10.x.100.101 varsa, 1.101-ə qoşulduqdan sonra 100.101 avtomatik ötürülür.\n")
+
+        self.preview_canvas = tk.Canvas(preview_tab, bg="#0B1120", highlightthickness=0)
+        self.preview_canvas.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.preview_canvas.bind("<Configure>", lambda _e: self._redraw_preview())
+
+    def _toggle_password(self) -> None:
+        self.pass_entry.configure(show="" if self.show_pass_var.get() else "*")
+
+    def _choose_folder(self) -> None:
+        chosen = filedialog.askdirectory(title="Çıxış Qovluğunu Seçin")
+        if chosen:
+            self.folder_var.set(chosen)
+
+    def _append_log(self, text: str) -> None:
+        self.log_box.insert(tk.END, text + "\n")
+        self.log_box.see(tk.END)
+
+    def _emit_log(self, text: str) -> None:
+        self.log_queue.put(("log", text))
+
+    def _emit_progress(self, pct: float, status_text: str) -> None:
+        self.log_queue.put(("progress", (pct, status_text)))
+
+    def _poll_queue(self) -> None:
+        try:
+            while True:
+                kind, payload = self.log_queue.get_nowait()
+                if kind == "log":
+                    self._append_log(str(payload))
+                elif kind == "progress":
+                    pct, st = payload
+                    self.progress_var.set(float(pct))
+                    self.status_var.set(str(st))
+                elif kind == "done":
+                    png_p = payload
+                    self.start_btn.configure(state=tk.NORMAL)
+                    self.ping_only_btn.configure(state=tk.NORMAL)
+                    self.demo_btn.configure(state=tk.NORMAL)
+                    self.stop_btn.configure(state=tk.DISABLED)
+                    if png_p and Path(png_p).exists():
+                        self.last_png_path = Path(png_p)
+                        self._load_preview_image(self.last_png_path)
+                        self.notebook.select(1)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_queue)
+
+    def _load_preview_image(self, png_path: Path) -> None:
+        self.last_png_path = png_path
+        self._redraw_preview()
+
+    def _redraw_preview(self) -> None:
+        if not self.last_png_path or not self.last_png_path.exists():
+            return
+        self.preview_canvas.delete("all")
+        cw = max(200, self.preview_canvas.winfo_width())
+        ch = max(200, self.preview_canvas.winfo_height())
+        if PIL_AVAILABLE:
+            try:
+                img = Image.open(self.last_png_path)
+                iw, ih = img.size
+                scale = min(cw / iw, ch / ih) * 0.96
+                nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+                resized = img.resize((nw, nh), Image.LANCZOS)
+                self._preview_photo = ImageTk.PhotoImage(resized)
+                self.preview_canvas.create_image(cw // 2, ch // 2, image=self._preview_photo, anchor=tk.CENTER)
+                return
+            except Exception:
+                pass
+        try:
+            self._preview_photo = tk.PhotoImage(file=str(self.last_png_path))
+            self.preview_canvas.create_image(cw // 2, ch // 2, image=self._preview_photo, anchor=tk.CENTER)
+        except Exception as exc:
+            self.preview_canvas.create_text(
+                cw // 2,
+                ch // 2,
+                text=f"Şəkil hazırdır: {self.last_png_path}\n({exc})",
+                fill="#F8FAFC",
+                font=("Segoe UI", 11),
+            )
+
+    def _set_running_state(self) -> None:
+        self.stop_event.clear()
+        self.start_btn.configure(state=tk.DISABLED)
+        self.ping_only_btn.configure(state=tk.DISABLED)
+        self.demo_btn.configure(state=tk.DISABLED)
+        self.stop_btn.configure(state=tk.NORMAL)
+        self.progress_var.set(0.0)
+
+    def _on_stop(self) -> None:
+        self.stop_event.set()
+        self._emit_log("[!] İstifadəçi tərəfindən dayandırma sorğusu göndərildi...")
+        self.status_var.set("Dayandırılır...")
+
+    def _on_ping_only(self) -> None:
+        raw_sub = self.subnet_text.get("1.0", tk.END).strip()
+        if not raw_sub:
+            messagebox.showwarning("Xəbərdarlıq", "Zəhmət olmasa yoxlamaq üçün ən azı 1 Subnet daxil edin (məs: 10.58.1.0/24).")
+            return
+        self._set_running_state()
+        self.notebook.select(0)
+
+        def _worker() -> None:
+            try:
+                ips = expand_subnets_and_ranges(raw_sub)
+                if not ips:
+                    self._emit_log("[!] Düzgün Subnet və ya IP formatı tapılmadı.")
+                    self.log_queue.put(("done", None))
+                    return
+                t_ms = int(self.ping_timeout_var.get().strip() or "700")
+                alive = ping_sweep_ips(
+                    ips,
+                    timeout_ms=t_ms,
+                    max_workers=64,
+                    log_fn=self._emit_log,
+                    progress_fn=lambda done, tot, up: self._emit_progress(
+                        (done / max(1, tot)) * 100.0,
+                        f"Ping yoxlanılır: {done}/{tot} (Aktiv: {up})",
+                    ),
+                    stop_event=self.stop_event,
+                )
+                self._emit_log(f"\n[✓] Ping keçən aktiv IP-lər ({len(alive)} ədəd): {', '.join(alive)}")
+                self._emit_progress(100.0, f"Ping tamamlandı: {len(alive)} aktiv IP tapıldı.")
+            except Exception as exc:
+                self._emit_log(f"[!] Xəta: {exc}")
+            finally:
+                self.log_queue.put(("done", None))
+
+        self.worker_thread = threading.Thread(target=_worker, daemon=True)
+        self.worker_thread.start()
+
+    def _on_run_demo(self) -> None:
+        folder = self.folder_var.get().strip() or f"weathermap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        out_dir = Path(folder)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.last_out_dir = out_dir
+        self._set_running_state()
+
+        def _worker() -> None:
+            try:
+                self._emit_log(f"\n[*] Demo topologiya hazırlanır -> Qovluq: {out_dir.resolve()}")
+                self._emit_progress(35.0, "Demo topologiya qurulur...")
+                run_demo_mode(out_dir)
+                png_p = out_dir / "l2_weathermap.png"
+                self._emit_log(f"[✓] Demo PNG və draw.io faylları hazırlandı: {png_p.resolve()}")
+                self._emit_progress(100.0, f"Demo tamamlandı: {png_p.name}")
+                self.log_queue.put(("done", str(png_p)))
+            except Exception as exc:
+                self._emit_log(f"[!] Demo xətası: {exc}")
+                self.log_queue.put(("done", None))
+
+        self.worker_thread = threading.Thread(target=_worker, daemon=True)
+        self.worker_thread.start()
+
+    def _on_start_discovery(self) -> None:
+        raw_sub = self.subnet_text.get("1.0", tk.END).strip()
+        raw_ncs = self.ncs_text.get("1.0", tk.END).strip()
+        raw_asr = self.asr_text.get("1.0", tk.END).strip()
+        username = self.user_var.get().strip()
+        password = self.pass_var.get()
+
+        if not raw_sub and not raw_ncs and not raw_asr:
+            messagebox.showwarning(
+                "Məlumat çatışmır",
+                "Zəhmət olmasa ya Subnet (məs: 10.58.1.0/24) ya da Cihaz IP-lərini daxil edin.",
+            )
+            return
+        if not username:
+            messagebox.showwarning("Məlumat çatışmır", "Zəhmət olmasa SSH Username daxil edin.")
+            return
+
+        folder = self.folder_var.get().strip() or f"weathermap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        out_dir = Path(folder)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.last_out_dir = out_dir
+
+        try:
+            t_ms = int(self.ping_timeout_var.get().strip() or "700")
+        except ValueError:
+            t_ms = 700
+        try:
+            workers = int(self.workers_var.get().strip() or "10")
+        except ValueError:
+            workers = 10
+
+        self._set_running_state()
+        self.notebook.select(0)
+
+        def _worker() -> None:
+            try:
+                self._emit_log(f"\n================ YENİ TOPOLOGİYA KƏŞFİYYATI ================")
+                self._emit_log(f"[+] Çıxış qovluğu: {out_dir.resolve()}")
+
+                alive_subnet_ips: List[str] = []
+                if raw_sub:
+                    subnet_ips = expand_subnets_and_ranges(raw_sub)
+                    if subnet_ips:
+                        alive_subnet_ips = ping_sweep_ips(
+                            subnet_ips,
+                            timeout_ms=t_ms,
+                            max_workers=64,
+                            log_fn=self._emit_log,
+                            progress_fn=lambda done, tot, up: self._emit_progress(
+                                (done / max(1, tot)) * 45.0,
+                                f"Addım 1/3 — Ping yoxlanılır: {done}/{tot} (Aktiv: {up})",
+                            ),
+                            stop_event=self.stop_event,
+                        )
+                    else:
+                        self._emit_log("[!] Subnet formatı oxuna bilmədi.")
+
+                if self.stop_event.is_set():
+                    self.log_queue.put(("done", None))
+                    return
+
+                ncs_ips = parse_ip_list(raw_ncs) if raw_ncs else []
+                asr_ips = parse_ip_list(raw_asr) if raw_asr else []
+
+                if not alive_subnet_ips and not ncs_ips and not asr_ips:
+                    self._emit_log("[!] Ping keçən və ya əl ilə verilmiş heç bir aktiv IP tapılmadı.")
+                    self._emit_progress(0.0, "Aktiv IP tapılmadı.")
+                    self.log_queue.put(("done", None))
+                    return
+
+                discovered_devices, ip_to_host, ncs_hosts = collect_all_devices_parallel(
+                    ncs_ips=ncs_ips,
+                    asr_ips=asr_ips,
+                    username=username,
+                    password=password,
+                    max_workers=workers,
+                    auto_ips=alive_subnet_ips,
+                    log_fn=self._emit_log,
+                    progress_fn=lambda done, tot: self._emit_progress(
+                        45.0 + (done / max(1, tot)) * 40.0,
+                        f"Addım 2/3 — SSH Kəşfiyyatı: {done}/{tot} IP yoxlanıldı",
+                    ),
+                    stop_event=self.stop_event,
+                )
+
+                if self.stop_event.is_set() or not discovered_devices:
+                    self._emit_log("[!] Heç bir cihazdan SSH məlumatı toplana bilmədi.")
+                    self._emit_progress(0.0, "SSH məlumatı toplanmadı.")
+                    self.log_queue.put(("done", None))
+                    return
+
+                self._emit_progress(90.0, "Addım 3/3 — Topologiya və Bandwidth xəritəsi çəkilir...")
+                nodes, links = build_unified_topology(discovered_devices, ip_to_host, ncs_hosts)
+                png_path = out_dir / "l2_weathermap.png"
+                generate_image_weathermap(nodes, links, png_path)
+
+                self._emit_log(f"\n[✓] TAMAMLANDI! PNG Şəkil: {png_path.resolve()}")
+                self._emit_log(f"[✓] Draw.io Faylı: {png_path.with_suffix('.drawio').resolve()}")
+                self._emit_progress(100.0, f"Tamamlandı! Cihaz: {len(nodes)}, Bağlantı: {len(links)}")
+                self.log_queue.put(("done", str(png_path)))
+            except Exception as exc:
+                self._emit_log(f"[!] Xəta baş verdi: {exc}")
+                self.log_queue.put(("done", None))
+
+        self.worker_thread = threading.Thread(target=_worker, daemon=True)
+        self.worker_thread.start()
+
+    def _open_output_folder(self) -> None:
+        target = self.last_out_dir or Path(self.folder_var.get().strip() or ".")
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            if platform.system().lower().startswith("win"):
+                os.startfile(str(target.resolve()))
+            elif platform.system().lower() == "darwin":
+                subprocess.Popen(["open", str(target.resolve())])
+            else:
+                subprocess.Popen(["xdg-open", str(target.resolve())])
+        except Exception as exc:
+            messagebox.showinfo("Qovluq Yolu", f"Qovluq: {target.resolve()}\n({exc})")
+
+    def _open_image_external(self) -> None:
+        if not self.last_png_path or not self.last_png_path.exists():
+            messagebox.showinfo("Məlumat", "Hələ topologiya şəkli yaradılmayıb.")
+            return
+        try:
+            if platform.system().lower().startswith("win"):
+                os.startfile(str(self.last_png_path.resolve()))
+            elif platform.system().lower() == "darwin":
+                subprocess.Popen(["open", str(self.last_png_path.resolve())])
+            else:
+                subprocess.Popen(["xdg-open", str(self.last_png_path.resolve())])
+        except Exception as exc:
+            messagebox.showinfo("Şəkil Yolu", f"Şəkil: {self.last_png_path.resolve()}\n({exc})")
+
+
+def run_cli_mode(args: argparse.Namespace) -> None:
+    """
+    Terminal (CLI) rejimində Subnet Ping + Eyni Cihaz Filtrləməsi + SSH + Topologiya.
+    """
+    print("=== Aztelekom L3 Topology With Draw.io And PNG with BW (CLI Rejimi) ===")
+
+    folder_name = args.output_dir.strip()
+    if not folder_name:
+        folder_name = input("1) Nəticələrin saxlanacağı qovluğun adını daxil edin (məs: Region_Topologiya): ").strip()
+    if not folder_name:
+        folder_name = f"weathermap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    out_dir = Path(folder_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"   [+] Qovluq hazırlandı: {out_dir.resolve()}")
+
+    # 2. Subnet daxiletməsi (Ping skanı üçün)
+    raw_subnets = " ".join(args.subnets) if args.subnets else ""
+    if not raw_subnets and not args.ncs_ips and not args.asr_ips:
+        raw_subnets = input(
+            "2) Pinglənəcək Subnet(lər)i daxil edin (məs: 10.58.1.0/24, 10.58.100.0/24 — ötürmək üçün Enter): "
+        ).strip()
+
+    alive_subnet_ips: List[str] = []
+    if raw_subnets:
+        expanded_ips = expand_subnets_and_ranges(raw_subnets)
+        if expanded_ips:
+            alive_subnet_ips = ping_sweep_ips(expanded_ips, timeout_ms=700, max_workers=64)
+
+    # 3. Əlavə Core NCS və Access ASR IP-ləri
+    ncs_ips = args.ncs_ips or []
+    if not ncs_ips:
+        prompt_ncs = (
+            "3) Əlavə Mərkəz (Core NCS) IP-lərini daxil edin (Subnet kifayətdirsə boş buraxıb Enter sıxın): "
+            if alive_subnet_ips
+            else "3) Mərkəz (Core NCS) cihazların IP ünvanlarını daxil edin (məs: x.x.x.x, x.x.x.y): "
+        )
+        raw_ncs = input(prompt_ncs).strip()
+        ncs_ips = parse_ip_list(raw_ncs)
+
+    asr_ips = args.asr_ips or []
+    if not asr_ips:
+        raw_asr = input("4) Əlavə Access (ASR 920/901) IP-lərini daxil edin (boş buraxmaq üçün Enter): ").strip()
+        asr_ips = parse_ip_list(raw_asr)
+
+    if not alive_subnet_ips and not ncs_ips and not asr_ips:
+        print("[!] Heç bir aktiv IP tapılmadı və daxil edilmədi. Çıxılır.")
+        sys.exit(1)
+
+    username = input("5) SSH Login (Username): ").strip()
+    password = getpass.getpass("6) SSH Parol (Password): ")
+
+    discovered_devices, ip_to_host, ncs_hosts = collect_all_devices_parallel(
+        ncs_ips=ncs_ips,
+        asr_ips=asr_ips,
+        username=username,
+        password=password,
+        max_workers=args.workers,
+        auto_ips=alive_subnet_ips,
+    )
+
+    if not discovered_devices:
+        print("[!] Heç bir cihazdan məlumat toplana bilmədi.")
+        sys.exit(1)
+
+    nodes, links = build_unified_topology(discovered_devices, ip_to_host, ncs_hosts)
+
+    png_path = out_dir / "l2_weathermap.png"
+    generate_image_weathermap(nodes, links, png_path)
+    print(f"\n[✓] PNG Weather Map şəkli hazırlandı: '{png_path.resolve()}'")
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aztelekom IS-IS & OSPF L3 Weather Map (PNG)")
+    parser = argparse.ArgumentParser(description="L3 Topology With Draw Io And Png with BW (Desktop GUI & CLI)")
     parser.add_argument("--demo", action="store_true", help="Nümunə məlumatlarla test PNG şəkli yarat")
+    parser.add_argument("--cli", action="store_true", help="Desktop GUI əvəzinə Terminal (CLI) rejimində işlət")
+    parser.add_argument("--subnets", nargs="*", help="Avtomatik Ping skanı üçün subnet(lər) (məs: 10.58.1.0/24)")
     parser.add_argument("--ncs-ips", nargs="*", help="Mərkəz (Core NCS) IP ünvanları")
     parser.add_argument("--asr-ips", nargs="*", help="Access (ASR 920/901) IP ünvanları")
     parser.add_argument("--workers", type=int, default=10, help="Paralel SSH qoşulma sayı (default: 10)")
@@ -1474,56 +3071,18 @@ def main() -> None:
         run_demo_mode(out_dir)
         return
 
-    print("=== Aztelekom L2/L3 Weather Map Topologiya Kəşfiyyatı (PNG) ===")
+    # Əgər `--cli` verilibsə və ya komanda sətrindən konkret arqumentlər ötürülübsə, yaxud ekran (DISPLAY) yoxdursa:
+    has_cli_args = bool(args.cli or args.subnets or args.ncs_ips or args.asr_ips)
+    if not has_cli_args and TK_AVAILABLE:
+        try:
+            root = tk.Tk()
+            _app = L3TopologyDesktopApp(root)
+            root.mainloop()
+            return
+        except Exception as exc:
+            print(f"[!] Desktop GUI pəncərəsi açıla bilmədi ({exc}), Terminal (CLI) rejiminə keçilir...")
 
-    # 1. İstifadəçidən qovluq adını soruş və avtomatik yarat
-    folder_name = args.output_dir.strip()
-    if not folder_name:
-        folder_name = input("1) Nəticələrin saxlanacağı qovluğun adını daxil edin (məs: Region_Topologiya): ").strip()
-    if not folder_name:
-        folder_name = f"weathermap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    out_dir = Path(folder_name)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"   [+] Qovluq hazırlandı: {out_dir.resolve()}")
-
-    # 2. Mərkəz (Core NCS) IP-lərini soruş
-    ncs_ips = args.ncs_ips or []
-    if not ncs_ips:
-        raw_ncs = input("2) Mərkəz (Core NCS) cihazların IP ünvanlarını daxil edin (məs: x.x.x.x, x.x.x.y): ").strip()
-        ncs_ips = parse_ip_list(raw_ncs)
-
-    if not ncs_ips:
-        print("[!] Heç bir NCS IP daxil edilmədi. Çıxılır.")
-        sys.exit(1)
-
-    # 3. Access (ASR 920 / 901) IP-lərini soruş
-    asr_ips = args.asr_ips or []
-    if not asr_ips:
-        raw_asr = input("3) Access (ASR 920/901) cihazların IP ünvanlarını daxil edin (vergül və ya boşluqla): ").strip()
-        asr_ips = parse_ip_list(raw_asr)
-
-    # 4. SSH Login və Parolu soruş
-    username = input("4) SSH Login (Username): ").strip()
-    password = getpass.getpass("5) SSH Parol (Password): ")
-
-    discovered_devices, ip_to_host, ncs_hosts = collect_all_devices_parallel(
-        ncs_ips=ncs_ips,
-        asr_ips=asr_ips,
-        username=username,
-        password=password,
-        max_workers=args.workers,
-    )
-
-    if not discovered_devices:
-        print("[!] Heç bir cihazdan məlumat toplana bilmədi.")
-        sys.exit(1)
-
-    nodes, links = build_unified_topology(discovered_devices, ip_to_host, ncs_hosts)
-
-    png_path = out_dir / "l2_weathermap.png"
-    generate_image_weathermap(nodes, links, png_path)
-    print(f"\n[✓] PNG Weather Map şəkli hazırlandı: '{png_path.resolve()}'")
+    run_cli_mode(args)
 
 
 if __name__ == "__main__":
