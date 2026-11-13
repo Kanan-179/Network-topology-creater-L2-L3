@@ -83,6 +83,15 @@ def norm(n):
     return n
 
 
+def mac_port_norm(p):
+    """MAC cedvelindeki Po0/0/4.Efp3995 -> po4 ; Te0/0/25.Efp3998 -> te0/0/25"""
+    p = p.split(".")[0]
+    m = re.match(r"(?i)^po\d+/\d+/(\d+)$", p)
+    if m:
+        return "po" + m.group(1)
+    return norm(p)
+
+
 def base(n):
     return norm(n).split(".")[0]
 
@@ -222,6 +231,12 @@ def xr_flow(conn, ip, host):
         rec(ip, host, "skip", "no neighbors", "SKIPPED")
         return
 
+    if not any(is_phys(k) for k in keep):
+        out(f"{R}  Qonsuluq portu (fiziki) tapilmadi -> tehlukesizlik ucun cihaz kecildi: "
+            f"{', '.join(sorted(keep)) or '-'}{X}")
+        rec(ip, host, "skip", "no physical keep port", "SKIPPED")
+        return
+
     up = parse_desc_up(run(conn, "show interfaces description | i up"))
     phys = [p for p in up if is_phys(p)]
     disable = [p for p in phys if norm(p) not in keep]
@@ -259,6 +274,88 @@ def xr_flow(conn, ip, host):
 
 
 # -------------------------------- IOS-XE --------------------------------
+def nbr_ips(ospf_out, isis_out):
+    """interfeys (norm) -> [qonsu IP-leri]; ping ile MAC yenilemek ucun"""
+    res = {}
+    for l in ospf_out.splitlines():
+        t = l.split()
+        if len(t) >= 6 and re.match(r"^\d+\.\d+\.\d+\.\d+$", t[0]):
+            res.setdefault(base(t[-1]), []).append(t[-2])
+    for l in isis_out.splitlines():
+        m = re.match(r"^\S+\s+L\d\s+(\S+)\s+(\d+\.\d+\.\d+\.\d+)\s+UP\b", l.strip(), re.I)
+        if m:
+            res.setdefault(base(m.group(1)), []).append(m.group(2))
+    return res
+
+
+MAC_ANY = re.compile(r"[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}")
+MAC_TYPES = {"dynamic", "static", "secure", "self", "dynamic-ex", "pseudo"}
+
+
+def parse_mac_ports(text):
+    """MAC cedvelinden (bridge-domain ve ya mac address-table cixisi) portlari cixarir"""
+    res = set()
+    for l in text.splitlines():
+        m = MAC_ANY.search(l)
+        if not m:
+            continue
+        rest = [t for t in l[m.end():].split() if t.lower() not in MAC_TYPES]
+        if rest:
+            res.add(mac_port_norm(rest[0]))
+    return res
+
+
+def bd_ports(conn, num, ips):
+    """bridge-domain portlari; birden cox portdursa MAC cedvelinden secir:
+    1) show bridge-domain  2) show mac address-table bdomain  3) ping ile yenile  4) istifadeciden sorus"""
+    o = run(conn, f"show bridge-domain {num}")
+    ports = re.findall(r"^\s+(\S+)\s+service instance\s+\d+", o, re.M)
+    out(white(f"  BD{num} portlari: " + (", ".join(ports) or "tapilmadi")))
+    if len(ports) < 2:
+        return ports
+
+    def pick(text, src):
+        macp = parse_mac_ports(text)
+        out(white(f"  MAC portlari ({src}): " + (", ".join(sorted(macp)) or "yoxdur")))
+        return [p for p in ports if norm(p) in macp]
+
+    def lookup(bd_text):
+        sel = pick(bd_text, "show bridge-domain")
+        if sel:
+            return sel
+        t = run(conn, f"show mac address-table bdomain {num}")
+        if re.search(r"(?i)invalid|incomplete|ambiguous", t):
+            t = run(conn, f"show mac-address-table bdomain {num}")
+        return pick(t, "mac address-table")
+
+    sel = lookup(o)
+    if not sel and ips:
+        out(white(f"  MAC tapilmadi -> {ips[0]} ping edilir (MAC ogrenmek ucun)"))
+        run(conn, f"ping {ips[0]} repeat 5")
+        sel = lookup(run(conn, f"show bridge-domain {num}"))
+    if sel:
+        out(white(f"  MAC cedvelinden secildi: {', '.join(sel)}"))
+        return sel
+    out(f"{R}  XEBERDARLIQ: BD{num} ucun MAC ile port mueyyen edilmedi, ozun sec:{X}")
+    for i, p in enumerate(ports, 1):
+        out(white(f"      {i}) {p}"))
+    while True:
+        a = input(f"{Y}  LLDP qalacaq port nomresi (meselen 2 ve ya 1,2) / [a]=hamisi / [s]=cihazi kec : {X}").strip().lower()
+        if LOG:
+            LOG.write(f"  > cavab: {a}\n")
+        if a in ("s", "skip"):
+            return None
+        if a in ("a", "all"):
+            return ports
+        try:
+            idx = [int(x) for x in a.replace(" ", "").split(",") if x]
+            chosen = [ports[i - 1] for i in idx if 1 <= i <= len(ports)]
+        except ValueError:
+            chosen = []
+        if chosen:
+            return chosen
+
+
 def xe_isis(o):
     res = set()
     for l in o.splitlines():
@@ -279,8 +376,11 @@ def xe_etherchannel(o):
 
 
 def xe_flow(conn, ip, host):
-    ospf = parse_ospf(run(conn, "show ip ospf neighbor"))
-    isis = xe_isis(run(conn, "show isis neighbors"))
+    ospf_out = run(conn, "show ip ospf neighbor")
+    isis_out = run(conn, "show isis neighbors")
+    ospf = parse_ospf(ospf_out)
+    isis = xe_isis(isis_out)
+    ips = nbr_ips(ospf_out, isis_out)
     out(white("  OSPF interfeysleri : " + (", ".join(sorted(ospf)) or "yoxdur")))
     out(white("  ISIS interfeysleri : " + (", ".join(sorted(isis)) or "yoxdur")))
 
@@ -292,15 +392,17 @@ def xe_flow(conn, ip, host):
     keep = set()
     si_ports = {}  # norm -> orijinal ad
     for n in ospf | isis:
-        m = re.match(r"(bdi|vlan)(\d+)$", n)
+        m = re.match(r"(bdi|bd|vlan|vl)(\d+)$", n)
         if m:
             kind, num = m.group(1), m.group(2)
-            o = run(conn, f"show bridge-domain {num}")
-            ports = re.findall(r"^\s+(\S+)\s+service instance\s+\d+", o, re.M)
-            out(white(f"  {kind.upper()}{num} portlari: " + (", ".join(ports) or "tapilmadi")))
+            ports = bd_ports(conn, num, ips.get(n, []))
+            if ports is None:
+                out(white("  -> cihaz kecildi (istifadeci secimi)"))
+                rec(ip, host, "skip", f"BD{num} port secilmedi", "SKIPPED")
+                return
             for p in ports:
                 keep.add(norm(p))
-                if kind == "bdi":  # ASR920: service instance + l2protocol peer lldp
+                if kind in ("bdi", "bd"):  # ASR920: service instance + l2protocol peer lldp
                     si_ports[norm(p)] = p
         else:
             keep.add(n)
@@ -310,6 +412,12 @@ def xe_flow(conn, ip, host):
         if k in pc:
             out(white(f"  {k} uzvleri: " + ", ".join(sorted(pc[k]))))
             keep |= pc[k]
+
+    if not any(is_phys(k) for k in keep):
+        out(f"{R}  Qonsuluq portu (fiziki) tapilmadi -> tehlukesizlik ucun cihaz kecildi: "
+            f"{', '.join(sorted(keep)) or '-'}{X}")
+        rec(ip, host, "skip", "no physical keep port", "SKIPPED")
+        return
 
     up = parse_desc_up(run(conn, "show interfaces description | i up"))
     phys = [p for p in up if is_phys(p)]

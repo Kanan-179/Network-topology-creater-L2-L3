@@ -84,7 +84,8 @@ def norm(n):
     n = n.strip().lower()
     for a, b in (("twentyfivegige", "twe"), ("hundredgige", "hu"), ("fortygige", "fo"),
                  ("tengigabitethernet", "te"), ("tengige", "te"),
-                 ("gigabitethernet", "gi"), ("fastethernet", "fa")):
+                 ("gigabitethernet", "gi"), ("fastethernet", "fa"),
+                 ("bundle-ether", "be"), ("port-channel", "po")):
         if n.startswith(a):
             return b + n[len(a):]
     return n
@@ -217,7 +218,7 @@ def current_desc(o):
     return d
 
 
-def collect_changes(conn, locs, detail_cmd, cur):
+def collect_changes(conn, locs, detail_cmd, cur, parent_fn=None):
     changes = []
     bundles = {}  # parent bundle -> qonsu hostname
     for loc in locs:
@@ -227,6 +228,8 @@ def collect_changes(conn, locs, detail_cmd, cur):
             out(white(f"  {loc}: uygun qonsu tapilmadi, kecildi"))
             continue
         sysname, pid, parent = r
+        if not parent and parent_fn:
+            parent = parent_fn(loc)
         if parent and BUNDLE_RE.match(parent):
             bundles.setdefault(parent, sysname)
         new = make_desc(sysname, pid)
@@ -282,6 +285,17 @@ def xr_flow(conn, ip, host):
     time.sleep(0.5)
 
 
+def xe_po_map(o):
+    """show etherchannel summary -> {norm(uzv port): 'Port-channelN'}"""
+    res = {}
+    for l in o.splitlines():
+        m = re.match(r"^\s*\d+\s+Po(\d+)\(", l)
+        if m:
+            for mem in re.findall(r"([A-Za-z]+\d+(?:/\d+)+)\(\w+\)", l):
+                res[norm(mem)] = f"Port-channel{m.group(1)}"
+    return res
+
+
 def xe_flow(conn, ip, host):
     locs = lldp_locals(run(conn, "show lldp neighbors"))
     if not locs:
@@ -295,7 +309,8 @@ def xe_flow(conn, ip, host):
         num = m.group(2) if m else ""
         return f"show lldp neighbors {long_name} {num} detail".replace("  ", " ")
 
-    changes = collect_changes(conn, locs, dcmd, cur)
+    pm = xe_po_map(run(conn, "show etherchannel summary"))
+    changes = collect_changes(conn, locs, dcmd, cur, parent_fn=lambda l: pm.get(norm(l)))
     approved = []
     for loc, old, new in changes:
         out(white(f"  kohne: {old or '(bos)'}"))
