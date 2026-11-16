@@ -18,6 +18,11 @@ from datetime import datetime
 from netmiko import ConnectHandler, SSHDetect
 
 try:
+    from live_monitor import Monitor
+except ImportError:
+    Monitor = None
+
+try:
     import colorama
     colorama.init()
 except ImportError:
@@ -207,6 +212,69 @@ def xr_isis(o):
     return res
 
 
+# ----------------------- commit confirmed (ping monitor) -----------------------
+CONFIRM_MIN = 1        # "commit confirmed minutes N"
+CONFIRM_MARGIN = 3     # son bu qeder saniyede tesdiq qebul olunmur (cihaz ozu geri alacaq)
+CFG_PROMPT = r"\(config[^)]*\)#"
+MON = None
+
+
+def console_confirm(deadline):
+    left = int(deadline - time.time())
+    a = input(f"{Y}  Pencere baglanib. {left} san icinde commit tesdiq edilsin? [y/n]: {X}").strip().lower()
+    if time.time() >= deadline:
+        return "timeout"
+    return "confirm" if a in ("y", "yes") else "rollback"
+
+
+def xr_commit(conn, ip, host):
+    """Ping monitor aciqdirsa: commit confirmed minutes N -> pencerede tesdiq -> commit.
+    Qaytarir: CONFIRMED | ROLLED_BACK | APPLIED | ERROR"""
+    if MON is None or not MON.alive():
+        out(f"  {white('Icra olunur:')} {cmdc('commit')}")
+        o = conn.send_command("commit", expect_string=CFG_PROMPT, read_timeout=120, strip_prompt=False)
+        out(white(o))
+        failed = bool(re.search(r"(?i)fail|error", o))
+        if failed:
+            out(f"{R}  COMMIT XETASI - yuxaridaki cavaba bax, candidate config abort edilir{X}")
+        conn.write_channel(("abort" if failed else "end") + "\n")
+        time.sleep(0.5)
+        return "ERROR" if failed else "APPLIED"
+
+    cmd = f"commit confirmed minutes {CONFIRM_MIN}"
+    out(f"  {white('Icra olunur:')} {cmdc(cmd)}")
+    t0 = time.time()
+    o = conn.send_command(cmd, expect_string=CFG_PROMPT, read_timeout=120, strip_prompt=False)
+    out(white(o))
+    if re.search(r"(?i)fail|error", o):
+        out(f"{R}  COMMIT XETASI - candidate config abort edilir{X}")
+        conn.write_channel("abort\n")
+        time.sleep(0.5)
+        return "ERROR"
+    expire = t0 + CONFIRM_MIN * 60
+    deadline = expire - CONFIRM_MARGIN
+    out(white(f"  Ping monitor penceresinde tesdiq gozlenilir ({int(deadline - time.time())} san)..."))
+    ans = MON.ask_confirm(ip, host, expire, CONFIRM_MARGIN)
+    if ans is None:
+        ans = console_confirm(deadline)
+    if ans == "confirm":
+        out(f"  {white('Icra olunur:')} {cmdc('commit')}")
+        o = conn.send_command("commit", expect_string=CFG_PROMPT, read_timeout=60, strip_prompt=False)
+        out(white(o))
+        conn.write_channel("end\n")
+        time.sleep(0.5)
+        out(white("  commit TESDIQLENDI"))
+        return "CONFIRMED"
+    out(f"{R}  Tesdiq verilmedi ({ans}) -> cihaz konfiqurasiyani avtomatik geri alacaq{X}")
+    wait = expire + 3 - time.time()
+    if wait > 0:
+        out(white(f"  Geri alinma gozlenilir ({int(wait)} san)..."))
+        time.sleep(wait)
+    conn.write_channel("end\n")
+    time.sleep(0.5)
+    return "ROLLED_BACK"
+
+
 def xr_flow(conn, ip, host):
     ospf = parse_ospf(run(conn, "show ip ospf neighbor"))
     isis = xr_isis(run(conn, "show isis neighbors"))
@@ -260,17 +328,9 @@ def xr_flow(conn, ip, host):
     out(white("  Config gonderilir..."))
     o = conn.send_config_set(lines, cmd_verify=False, exit_config_mode=False, read_timeout=60)
     out(white(o))
-    out(f"  {white('Icra olunur:')} {cmdc('commit')}")
-    o = conn.send_command("commit", expect_string=r"\(config[^)]*\)#",
-                          read_timeout=120, strip_prompt=False)
-    out(white(o))
-    failed = bool(re.search(r"(?i)fail|error", o))
-    if failed:
-        out(f"{R}  COMMIT XETASI - yuxaridaki cavaba bax, candidate config abort edilir{X}")
-    conn.write_channel(("abort" if failed else "end") + "\n")
-    time.sleep(0.5)
+    status = xr_commit(conn, ip, host)
     for label, ls in approved:
-        rec(ip, host, label, "; ".join(ls), "APPLIED")
+        rec(ip, host, label, "; ".join(ls), status)
 
 
 # -------------------------------- IOS-XE --------------------------------
@@ -464,6 +524,8 @@ def process(ip, user, pw):
         conn, dtype = connect(ip, user, pw)
         host = conn.find_prompt().strip("#> ")
         out(f"{white('Qosuldu:')} {ipc(ip)} {white(host + '  [' + dtype + ']')}")
+        if MON:
+            MON.set_host(ip, host)
         out(f"{B}{'-' * 78}{X}")
         if dtype == "cisco_xr":
             xr_flow(conn, ip, host)
@@ -514,7 +576,7 @@ def save_xlsx(path):
 
 
 def main():
-    global LOG
+    global LOG, MON
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     name = input("Log/hesabat fayllari ucun ad (bos buraxa bilersen): ").strip()
     name = re.sub(r'[\\/:*?"<>|\s]+', "_", name).strip("_")
@@ -531,6 +593,18 @@ def main():
     want_xlsx = input("Excel hesabat da yaradilsin? [y/N]: ").strip().lower() == "y"
 
     out(white(f"{len(ips)} cihaz: ") + "  ".join(ipc(i) for i in ips))
+    if Monitor and input("Ping monitor penceresi acilsin? (XR ucun commit confirmed tesdiqi orada olacaq) [Y/n]: ").strip().lower() != "n":
+        try:
+            MON = Monitor(ips)
+            time.sleep(1.5)
+            if not MON.alive():
+                out(f"{R}Ping monitor acilmadi (tkinter yoxdur?) -> adi commit istifade olunacaq{X}")
+                MON = None
+        except Exception as e:
+            out(f"{R}Ping monitor xetasi: {e} -> adi commit istifade olunacaq{X}")
+            MON = None
+    elif not Monitor:
+        out(white("live_monitor.py tapilmadi -> adi commit istifade olunacaq"))
     try:
         for ip in ips:
             process(ip, user, pw)
@@ -541,6 +615,8 @@ def main():
         out()
         out(f"{B}{'=' * 78}{X}")
         out(white(f"Execution log: {log_path}"))
+        if MON:
+            MON.done()
         if want_xlsx:
             save_xlsx(f"{prefix}lldp_report_{ts}.xlsx")
         LOG.flush()
