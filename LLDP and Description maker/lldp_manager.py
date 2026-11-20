@@ -12,10 +12,17 @@ import os
 import re
 import sys
 import getpass
+import traceback
 import time
 from datetime import datetime
 
-from netmiko import ConnectHandler, SSHDetect
+try:
+    from netmiko import ConnectHandler, SSHDetect
+except ImportError as _e:      # pencere ani baglanmasin: xetani goster ve ENTER gozle
+    print("XETA: netmiko modulu tapilmadi ->", _e)
+    print("Qurulum: python -m pip install -r requirements.txt   (eyni Python ile isletdiyine emin ol)")
+    input("Press ENTER to exit.")
+    sys.exit(1)
 
 try:
     from live_monitor import Monitor
@@ -275,6 +282,111 @@ def xr_commit(conn, ip, host):
     return "ROLLED_BACK"
 
 
+# ------------- movcud LLDP veziyyetini oxu (artiq duzgundurse komanda yazma) -------------
+LONG_XE = {"te": "TenGigabitEthernet", "gi": "GigabitEthernet", "fo": "FortyGigabitEthernet",
+           "hu": "HundredGigE", "fa": "FastEthernet", "twe": "TwentyFiveGigE"}
+
+
+def onoff(b):
+    return "ON" if b else "OFF"
+
+
+def parse_lldp_if(o):
+    """'show lldp interface' -> {norm(port): {'tx': bool, 'rx': bool}}"""
+    res, cur = {}, None
+    for l in o.splitlines():
+        m = re.match(r"^\s*([A-Za-z][\w-]*[\d/.]+):\s*$", l)
+        if m:
+            cur = norm(m.group(1))
+            res[cur] = {}
+            continue
+        t = re.match(r"^\s*(Tx|Rx):\s*(enabled|disabled)", l, re.I)
+        if t and cur:
+            res[cur][t.group(1).lower()] = (t.group(2).lower() == "enabled")
+    return {k: v for k, v in res.items() if "tx" in v and "rx" in v}
+
+
+def lldp_show_cmd(p, xe):
+    if not xe:
+        return f"show lldp interface {p}"
+    m = re.match(r"^([A-Za-z]+)([\d/]+)$", p)
+    if not m:
+        return f"show lldp interface {p}"
+    return f"show lldp interface {LONG_XE.get(m.group(1).lower(), m.group(1))} {m.group(2)}"
+
+
+def get_lldp_states(conn, ports, xe):
+    """Butun interfeyslerin LLDP tx/rx veziyyeti; siyahida olmayan portlar ayrica sorgulanir"""
+    st = parse_lldp_if(run(conn, "show lldp interface"))
+    for p in ports:
+        if norm(p) in st:
+            continue
+        o = run(conn, lldp_show_cmd(p, xe))
+        one = parse_lldp_if(o)
+        if norm(p) in one:
+            st[norm(p)] = one[norm(p)]
+            continue
+        t = re.search(r"(?im)^\s*Tx:\s*(enabled|disabled)", o)
+        r = re.search(r"(?im)^\s*Rx:\s*(enabled|disabled)", o)
+        if t and r:
+            st[norm(p)] = {"tx": t.group(1).lower() == "enabled", "rx": r.group(1).lower() == "enabled"}
+    return st
+
+
+def show_state(p, st, want):
+    name = f"{p:<14}"
+    if st is None:
+        out(white(f"    {name} cari: oxunmadi            hedef: {onoff(want)}  -> tetbiq olunacaq"))
+        return
+    ok = st["tx"] == want and st["rx"] == want
+    col = G if ok else Y
+    verdict = "duzgundur" if ok else "deyisecek"
+    out(white(f"    {name} tx={onoff(st['tx']):<3} rx={onoff(st['rx']):<3}  hedef={onoff(want)}  ")
+        + f"{col}-> {verdict}{X}")
+
+
+def xr_lldp_global(conn):
+    o = run(conn, "show running-config lldp")
+    return bool(re.search(r"(?m)^\s*lldp\b", o)) and "No such configuration" not in o
+
+
+def xe_lldp_global(conn):
+    o = run(conn, "show running-config | include ^lldp run")
+    return bool(re.search(r"(?m)^lldp run\b", o))
+
+
+BUNDLE_MEM_RE = re.compile(
+    r"^\s*((?:TenGigE|HundredGigE|FortyGigE|TwentyFiveGigE|GigabitEthernet|Te|Hu|Fo|Twe|Gi)\d+(?:/\d+)+)\b",
+    re.M | re.I)
+
+
+def xr_bundle_members(conn, num):
+    """Bundle-Ether<num> uzv portlari (norm adlarla set). Tapilmasa: raw cixisi gosterir, istifadeciden sorusur.
+    None qaytarsa -> cihaz kecilsin."""
+    o = run(conn, f"show bundle bundle-ether{num}")
+    mem = {norm(x) for x in BUNDLE_MEM_RE.findall(o)}
+    if not mem:   # ikinci yol: umumi 'show bundle' icinden bu bundle-in bolmesi
+        o2 = run(conn, "show bundle")
+        sec = re.search(rf"(?ims)^\s*Bundle-Ether{num}\b.*?(?=^\s*Bundle-Ether\d+\b|\Z)", o2)
+        if sec:
+            mem = {norm(x) for x in BUNDLE_MEM_RE.findall(sec.group(0))}
+            o = sec.group(0)
+    if mem:
+        return mem
+    out(f"{R}  XEBERDARLIQ: Bundle-Ether{num} uzv portlari avtomatik tapilmadi. Cihazin cavabi:{X}")
+    for l in o.splitlines()[:40]:
+        out(white("      | " + l))
+    while True:
+        a = input(f"{Y}  Uzv portlari yaz (meselen Te0/0/0/16,Te0/0/0/17) / [s]=cihazi kec : {X}").strip()
+        if LOG:
+            LOG.write(f"  > cavab: {a}\n")
+        if a.lower() in ("s", "skip"):
+            return None
+        mem = {norm(x) for x in re.split(r"[,\s]+", a) if re.match(r"(?i)^[a-z]+\d+(/\d+)+$", x)}
+        if mem:
+            return mem
+
+
 def xr_flow(conn, ip, host):
     ospf = parse_ospf(run(conn, "show ip ospf neighbor"))
     isis = xr_isis(run(conn, "show isis neighbors"))
@@ -286,11 +398,11 @@ def xr_flow(conn, ip, host):
         keep.add(n)
         m = re.match(r"be(\d+)$", n)
         if m:
-            o = run(conn, f"show bundle bundle-ether{m.group(1)}")
-            mem = re.findall(
-                r"^\s+((?:TenGigE|HundredGigE|FortyGigE|TwentyFiveGigE|GigabitEthernet|Te|Hu|Fo|Twe|Gi)[\d/]+)\s",
-                o, re.M | re.I)
-            mem = {norm(x) for x in mem}
+            mem = xr_bundle_members(conn, m.group(1))
+            if mem is None:
+                out(white("  -> cihaz kecildi (bundle uzvleri mueyyen edilmedi)"))
+                rec(ip, host, "skip", f"BE{m.group(1)} uzvleri tapilmadi", "SKIPPED")
+                return
             out(white(f"  {n} uzvleri: " + (", ".join(sorted(mem)) or "tapilmadi")))
             keep |= mem
 
@@ -312,15 +424,40 @@ def xr_flow(conn, ip, host):
     out(white("  LLDP sonecek: " + (", ".join(disable) or "yoxdur")))
 
     names = {norm(p): p for p in phys}
-    enable = sorted(p for p in keep if is_phys(p))
-    blocks = [("Global LLDP aktiv", ["lldp"])]
+    enable = [names.get(p, p) for p in sorted(k for k in keep if is_phys(k))]
+
+    glob = xr_lldp_global(conn)
+    out(white("  Global LLDP: " + ("aktivdir (komanda yazilmayacaq)" if glob else "AKTIV DEYIL -> aktiv edilecek")))
+    states = get_lldp_states(conn, enable + disable, xe=False) if glob else {}
+    out(white("  Portlarin movcud LLDP veziyyeti:"))
+
+    blocks = []
+    if not glob:
+        blocks.append(("Global LLDP aktiv", ["lldp"]))
     for p in enable:
-        p = names.get(p, p)
-        blocks.append((f"{p} - LLDP receive/transmit aktiv",
-                       [f"interface {p}", "no lldp transmit disable", "no lldp receive disable", "root"]))
+        st = states.get(norm(p))
+        show_state(p, st, True)
+        cmds = []
+        if st is None or not st["tx"]:
+            cmds.append("no lldp transmit disable")
+        if st is None or not st["rx"]:
+            cmds.append("no lldp receive disable")
+        if cmds:
+            blocks.append((f"{p} - LLDP aktiv et", [f"interface {p}"] + cmds + ["root"]))
     for p in disable:
-        blocks.append((f"{p} - LLDP disable",
-                       [f"interface {p}", "lldp", "receive disable", "transmit disable", "root"]))
+        st = states.get(norm(p))
+        show_state(p, st, False)
+        sub = []
+        if st is None or st["rx"]:
+            sub.append("receive disable")
+        if st is None or st["tx"]:
+            sub.append("transmit disable")
+        if sub:
+            blocks.append((f"{p} - LLDP disable", [f"interface {p}", "lldp"] + sub + ["root"]))
+    if not blocks:
+        out(f"{G}  Butun LLDP veziyyeti artiq duzgundur -> hecne edilmir{X}")
+        rec(ip, host, "lldp", "already correct", "UNCHANGED")
+        return
     approved = select_blocks(ip, host, blocks)
     if not approved:
         return
@@ -367,7 +504,7 @@ def parse_mac_ports(text):
 
 def bd_ports(conn, num, ips):
     """bridge-domain portlari; birden cox portdursa MAC cedvelinden secir:
-    1) show bridge-domain  2) show mac address-table bdomain  3) ping ile yenile  4) istifadeciden sorus"""
+    1) show bridge-domain  2) show mac address-table bdomain  3) show mac-address-table dynamic vlan  4) ping ile yenile  5) istifadeciden sorus"""
     o = run(conn, f"show bridge-domain {num}")
     ports = re.findall(r"^\s+(\S+)\s+service instance\s+\d+", o, re.M)
     out(white(f"  BD{num} portlari: " + (", ".join(ports) or "tapilmadi")))
@@ -386,7 +523,11 @@ def bd_ports(conn, num, ips):
         t = run(conn, f"show mac address-table bdomain {num}")
         if re.search(r"(?i)invalid|incomplete|ambiguous", t):
             t = run(conn, f"show mac-address-table bdomain {num}")
-        return pick(t, "mac address-table")
+        sel = pick(t, "mac address-table")
+        if sel:
+            return sel
+        t = run(conn, f"show mac-address-table dynamic vlan {num}")   # alternativ yol
+        return pick(t, "mac-address-table dynamic vlan")
 
     sel = lookup(o)
     if not sel and ips:
@@ -485,8 +626,22 @@ def xe_flow(conn, ip, host):
     out(white("  LLDP qalan  : " + (", ".join(sorted(keep)) or "-")))
     out(white("  LLDP sonecek: " + (", ".join(disable) or "yoxdur")))
 
-    blocks = [("Global LLDP aktiv", ["lldp run"])]
+    names = {norm(p): p for p in phys}
+    enable = [names.get(p, p) for p in sorted(k for k in keep if is_phys(k))]
+
+    glob = xe_lldp_global(conn)
+    out(white("  Global LLDP: " + ("aktivdir (lldp run yazilmayacaq)" if glob else "AKTIV DEYIL -> lldp run yazilacaq")))
+    states = get_lldp_states(conn, enable + disable, xe=True) if glob else {}
+    out(white("  Portlarin movcud LLDP veziyyeti:"))
+
+    blocks = []
+    if not glob:
+        blocks.append(("Global LLDP aktiv", ["lldp run"]))
     for n, p in si_ports.items():
+        cfg = run(conn, f"show running-config interface {p}")
+        if re.search(r"l2protocol peer lldp", cfg):
+            out(f"{G}    {p}: l2protocol peer lldp artiq var -> duzgundur{X}")
+            continue
         blocks.append((f"{p} - L2 LLDP peer",
                        [f"interface {p}",
                         f"service instance {SERVICE_INST} ethernet",
@@ -494,14 +649,30 @@ def xe_flow(conn, ip, host):
                         "l2protocol peer lldp",
                         f"bridge-domain {SERVICE_BD}",
                         "exit", "exit"]))
-    names = {norm(p): p for p in phys}
-    for p in sorted(k for k in keep if is_phys(k)):
-        p = names.get(p, p)
-        blocks.append((f"{p} - LLDP transmit/receive aktiv",
-                       [f"interface {p}", "lldp transmit", "lldp receive", "exit"]))
+    for p in enable:
+        st = states.get(norm(p))
+        show_state(p, st, True)
+        cmds = []
+        if st is None or not st["tx"]:
+            cmds.append("lldp transmit")
+        if st is None or not st["rx"]:
+            cmds.append("lldp receive")
+        if cmds:
+            blocks.append((f"{p} - LLDP aktiv et", [f"interface {p}"] + cmds + ["exit"]))
     for p in disable:
-        blocks.append((f"{p} - LLDP disable",
-                       [f"interface {p}", "no lldp receive", "no lldp transmit", "exit"]))
+        st = states.get(norm(p))
+        show_state(p, st, False)
+        cmds = []
+        if st is None or st["rx"]:
+            cmds.append("no lldp receive")
+        if st is None or st["tx"]:
+            cmds.append("no lldp transmit")
+        if cmds:
+            blocks.append((f"{p} - LLDP disable", [f"interface {p}"] + cmds + ["exit"]))
+    if not blocks:
+        out(f"{G}  Butun LLDP veziyyeti artiq duzgundur -> hecne edilmir{X}")
+        rec(ip, host, "lldp", "already correct", "UNCHANGED")
+        return
     approved = select_blocks(ip, host, blocks)
     if not approved:
         return
@@ -548,8 +719,9 @@ def load_ips():
     path = sys.argv[1] if len(sys.argv) > 1 else "ips.txt"
     if os.path.exists(path):
         text = open(path, encoding="utf-8", errors="ignore").read()
+        print(f"IP siyahisi fayldan oxundu: {os.path.abspath(path)}")
     else:
-        print(f"{path} tapilmadi. IP-leri yapisdir, bitirmek ucun bos setir:")
+        print(f"{path} tapilmadi (axtarilan yer: {os.path.abspath(path)}). IP-leri yapisdir, bitirmek ucun bos setir:")
         lines = []
         while True:
             l = input()
@@ -575,18 +747,71 @@ def save_xlsx(path):
     out(white(f"Excel: {path}"))
 
 
+def flush_stdin():
+    """Icra zamani tesadufen basilmis ENTER/duymeleri sil ki, 'Press ENTER' sorgusu atlanmasin"""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        else:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
+def wait_enter():
+    flush_stdin()
+    try:
+        input("Press ENTER to exit.")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def ask_name(prompt):
+    try:
+        return input(prompt).strip()
+    except UnicodeDecodeError:
+        print("Ad oxuna bilmedi (simvol kodlamasi), ad olmadan davam edilir.")
+        return ""
+
+
+def safe_prefix(name):
+    """Fayl adi ucun tehlukesiz prefiks (Windows-da etibarsiz simvollar, rezerv adlar, uzun ad)"""
+    name = re.sub(r"[^\w\-.() ]+", "_", name.strip(), flags=re.UNICODE)
+    name = re.sub(r"\s+", "_", name).strip("._ ")[:60]
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+    if name.upper() in reserved:
+        name = "_" + name
+    return f"{name}_" if name else ""
+
+
+def pick_out_dir():
+    """Fayllar yazila bilen ilk qovluga yazilir: cari qovluq -> script qovlugu -> ev qovlugu"""
+    for d in (os.getcwd(), os.path.dirname(os.path.abspath(__file__)), os.path.expanduser("~")):
+        try:
+            p = os.path.join(d, ".write_test")
+            open(p, "w").close()
+            os.remove(p)
+            return d
+        except Exception:
+            continue
+    return os.getcwd()
+
+
 def main():
     global LOG, MON
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = input("Log/hesabat fayllari ucun ad (bos buraxa bilersen): ").strip()
-    name = re.sub(r'[\\/:*?"<>|\s]+', "_", name).strip("_")
-    prefix = f"{name}_" if name else ""
-    log_path = f"{prefix}lldp_execution_log_{ts}.txt"
+    prefix = safe_prefix(ask_name("Log/hesabat fayllari ucun ad (bos buraxa bilersen): "))
+    out_dir = pick_out_dir()
+    log_path = os.path.join(out_dir, f"{prefix}lldp_execution_log_{ts}.txt")
     LOG = open(log_path, "w", encoding="utf-8")
 
     ips = load_ips()
     if not ips:
         print("IP tapilmadi.")
+        wait_enter()
         return
     user = input("Username: ").strip()
     pw = getpass.getpass("Password: ")
@@ -612,17 +837,27 @@ def main():
     except (StopRequested, KeyboardInterrupt):
         out(f"\n{R}Istifadeci terefinden dayandirildi.{X}")
     finally:
-        out()
-        out(f"{B}{'=' * 78}{X}")
-        out(white(f"Execution log: {log_path}"))
-        if MON:
-            MON.done()
-        if want_xlsx:
-            save_xlsx(f"{prefix}lldp_report_{ts}.xlsx")
-        LOG.flush()
-        input("Press ENTER to exit.")
-        LOG.close()
+        try:
+            out()
+            out(f"{B}{'=' * 78}{X}")
+            out(white(f"Execution log: {log_path}"))
+            if MON:
+                MON.done()
+            if want_xlsx:
+                save_xlsx(os.path.join(out_dir, f"{prefix}lldp_report_{ts}.xlsx"))
+            LOG.flush()
+        except Exception as e:
+            print("Son emeliyyatlarda xeta:", e)
+        wait_enter()
+        try:
+            LOG.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        wait_enter()

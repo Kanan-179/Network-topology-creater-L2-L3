@@ -46,7 +46,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
-from matplotlib.patches import FancyBboxPatch, PathPatch, Rectangle
+from matplotlib.patches import Circle, FancyBboxPatch, PathPatch, Rectangle
 from matplotlib.path import Path as MplPath
 
 try:
@@ -68,6 +68,14 @@ try:
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+
+try:
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
 
 
 # =====================================================================
@@ -295,6 +303,42 @@ def classify_device_hw_tier(hostname: str, is_ncs_flag: bool = False) -> Tuple[s
     if "NE40" in h or "NE8000-X" in h or "NCS" in h or is_ncs_flag:
         return ("core", 1)
     return ("other", 3)
+
+
+def extract_ats_site_code(hostname: str) -> str:
+    """
+    Cihazın adından ATS / Stansiya nömrəsini (məs: 'ATS374M14' -> '374', '431M14' -> '431',
+    'ATS-431-F1-2' -> '431', '374F1_1' -> '374') çıxarır ki, eyni ATS-də yerləşən
+    fiziki yaxın cihazlar (M14 və onun F1-ləri) topologiyada bir yerdə qruplaşdırılsın.
+    """
+    if not hostname:
+        return ""
+    raw = hostname.strip()
+    # IP ünvanlarından ATS kodu çıxarma
+    if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", raw):
+        return ""
+    h = raw.upper()
+    # Core cihaz adlarından (NE40, NCS) ATS kodu çıxarma
+    if "NE40" in h or "NE8000" in h or "NCS" in h or "CORE" in h:
+        return ""
+    # 1. 'ATS374', 'ATS-431', 'ATS_512'
+    m = re.search(r"ATS[\-\_\s]*(\d{2,4})", h)
+    if m:
+        return m.group(1)
+    # 2. '431M14', '374-F1-1', '432_M14'
+    m = re.search(r"(?:^|[^0-9A-Z])(\d{2,4})[\-\_\s]*(?:M14|M8|M4|F1)", h)
+    if m:
+        return m.group(1)
+    # 3. 'M14-431', 'F1-374'
+    m = re.search(r"(?:M14|M8|M4|F1)[A-Z]?[\-\_\s]*(\d{3,4})(?:[^0-9]|$)", h)
+    if m:
+        return m.group(1)
+    # 4. Model adlarını silib qalan 3 rəqəmli stansiya kodunu yoxla
+    cleaned = re.sub(r"(?:ASR920|ASR903|ASR9K|ASR|M14|M8|M4|F1[A-Z]?|SW\d+|RT\d+)", " ", h)
+    m = re.search(r"(?:^|[^0-9])(\d{3})(?:[^0-9]|$)", cleaned)
+    if m:
+        return m.group(1)
+    return ""
 
 
 def decode_isis_bcd_sysid_to_ip(sys_id: str) -> Optional[str]:
@@ -601,11 +645,12 @@ def parse_isis_adjacency(output: str) -> List[Dict[str, str]]:
     current_adj: Optional[Dict[str, str]] = None
 
     intf_prefix = (
-        r"(?:100GE|100GigabitEthernet|50GE|40GE|40GigabitEthernet|25GE|25GigabitEthernet|"
+        r"(?:400GE|200GE|100GE|100GigabitEthernet|50GE|40GE|40GigabitEthernet|25GE|25GigabitEthernet|"
         r"10GE|10GigabitEthernet|XGigabitEthernet|XGE|GE|Te|TenGigE|TenGigabitEthernet|"
         r"Gi|GigabitEthernet|Hu|HundredGigE|BE|Bundle-Ether|Eth-Trunk|ET|"
+        r"Ethernet|MEth|Eth(?!-Trunk)|Tunnel|Tun|"
         r"Fo|FortyGigE|TF|TwentyFiveGigE|Fi|FiftyGigE|Fa|FastEthernet|"
-        r"Po|Port-channel|Vlanif|Vl|Vlan|BDI|BVI|LoopBack)[0-9/\.\-:]*"
+        r"Po|Port-channel|Vlanif|Vl|Vlan|BDI|BVI|BD|Tu|LoopBack)[0-9/\.\-:]*"
     )
 
     for raw_line in output.splitlines():
@@ -643,8 +688,8 @@ def parse_isis_adjacency(output: str) -> List[Dict[str, str]]:
             rf"({intf_prefix})\s+"
             r"(\S+)\s+"
             r"(Up|Init|Down|UP|INIT|DOWN)\s+"
-            r"(\d+s?)\s+"
-            r"(L1/L2|L1L2|L1/2|L1|L2)\b",
+            r"(\d+s?|-+)\s+"
+            r"(L1/L2|L1L2|L1/2|L1|L2|P2P)\b",
             line,
             flags=re.IGNORECASE,
         )
@@ -694,17 +739,19 @@ def parse_isis_adjacency(output: str) -> List[Dict[str, str]]:
             r"^([A-Za-z0-9_\-\.]+)\s+"
             r"(L1/L2|L1L2|L1/2|L1|L2)\s+"
             rf"({intf_prefix})\s+"
-            r"(\d{1,3}(?:\.\d{1,3}){3})\s+"
+            r"(\d{1,3}(?:\.\d{1,3}){3}|--+|-|unnumbered)\s+"
             r"(UP|Up|INIT|Init|DOWN|Down)\s+"
             r"(\S+)",
             line,
             flags=re.IGNORECASE,
         )
         if match_xe_a:
-            sys_id, _isis_type, intf, nbr_ip, state, hold = match_xe_a.groups()
+            sys_id, _isis_type, intf, raw_ip, state, hold = match_xe_a.groups()
+            cleaned_sys = clean_hostname(sys_id)
+            nbr_ip = raw_ip if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", raw_ip) else (decode_isis_bcd_sysid_to_ip(cleaned_sys) or "")
             current_adj = {
                 "protocol": "IS-IS",
-                "neighbor_id": clean_hostname(sys_id),
+                "neighbor_id": cleaned_sys,
                 "neighbor_ip": nbr_ip,
                 "local_interface": intf,
                 "state": state.capitalize(),
@@ -769,7 +816,7 @@ def parse_ospf_neighbors(output: str) -> List[Dict[str, str]]:
             r"^(\d{1,3}(?:\.\d{1,3}){3})\s+"
             r"(\d+)\s+"
             r"([A-Za-z0-9]+\s*/\s*[A-Za-z0-9\-]+|FULL|Full|2WAY|Init|ExStart|Exchange|Loading)\s+"
-            r"([0-9:]+|\d+[wdhms]+)\s+"
+            r"([0-9:]+|\d+[wdhms]+|-+)\s+"
             r"(\d{1,3}(?:\.\d{1,3}){3})\s+"
             r"(\S+)",
             line,
@@ -867,6 +914,112 @@ def extract_isis_self_sysids(output: str) -> Set[str]:
         if dec:
             sids.add(dec)
     return sids
+
+
+def parse_lldp_cdp_neighbors(lldp_out: str, cdp_out: str = "") -> List[Dict[str, str]]:
+    """
+    Əgər cihazda OSPF və ya IS-IS qonşuluğu tapılmazsa (məsələn, L2 switch, statik marşrutlu
+    və ya BGP-li Access avadanlıq), fiziki bağlantını tapmaq üçün Huawei `display lldp neighbor brief`
+    və Cisco `show lldp neighbors` / `show cdp neighbors` çıxışlarını təhlil edir.
+    """
+    nbrs: List[Dict[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+
+    # 1) Huawei `display lldp neighbor brief`:
+    # Local Intf       Neighbor Dev             Neighbor Intf             Exptime(s)
+    # GE0/0/1          ATS431M14                GE0/1/2                   105
+    # 2) Cisco `show lldp neighbors`:
+    # Device ID        Local Intf     Hold-time  Capability      Port ID
+    # ATS431M14        Gi0/0/1        120        R               Gi0/1/2
+    for raw_line in (lldp_out or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("Local", "Device ID", "Capability", "Total", "System", "---", "===")):
+            continue
+        # Huawei format: LocalIntf  NeighborDev  NeighborIntf  Exptime
+        m_hw = re.match(
+            r"^([A-Za-z]{2,}[0-9/\.\-:]+)\s+(\S+)\s+([A-Za-z0-9/\.\-:]+)\s+\d+",
+            line,
+        )
+        if m_hw:
+            l_intf, nbr_dev, r_intf = m_hw.groups()
+            n_clean = clean_hostname(nbr_dev)
+            if n_clean and not re.match(r"^\d+$", n_clean):
+                k = (n_clean.upper(), shorten_interface_name(l_intf))
+                if k not in seen:
+                    seen.add(k)
+                    nbrs.append({
+                        "protocol": "LLDP",
+                        "neighbor_id": n_clean,
+                        "neighbor_ip": "",
+                        "local_interface": l_intf,
+                        "remote_interface": r_intf,
+                        "state": "Up",
+                        "uptime": "LLDP",
+                    })
+            continue
+
+        # Cisco LLDP format: DeviceID  LocalIntf  HoldTime  [Cap...]  PortID
+        m_cisco_lldp = re.match(
+            r"^(\S+)\s+([A-Za-z]{2,}[0-9/\.\-:]+)\s+\d+\s+",
+            line,
+        )
+        if m_cisco_lldp:
+            nbr_dev, l_intf = m_cisco_lldp.groups()
+            n_clean = clean_hostname(nbr_dev)
+            if n_clean and not re.match(r"^\d+$", n_clean):
+                k = (n_clean.upper(), shorten_interface_name(l_intf))
+                if k not in seen:
+                    seen.add(k)
+                    nbrs.append({
+                        "protocol": "LLDP",
+                        "neighbor_id": n_clean,
+                        "neighbor_ip": "",
+                        "local_interface": l_intf,
+                        "remote_interface": "",
+                        "state": "Up",
+                        "uptime": "LLDP",
+                    })
+
+    # 3) Cisco `show cdp neighbors`:
+    # Device ID        Local Intrfce     Holdtme    Capability  Platform  Port ID
+    prev_dev = ""
+    for raw_line in (cdp_out or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("Capability", "Device ID", "Total", "---", "===")):
+            prev_dev = ""
+            continue
+        # Wrapped device ID on its own line
+        if len(line.split()) == 1 and any(c.isalpha() for c in line):
+            prev_dev = line
+            continue
+        m_cdp = re.match(
+            r"^(?:(\S+)\s+)?(Eth|Fas|Gig|Ten|Twe|For|Hun|Gi|Te|Fa|Hu|Po|BE|ET|GE|10GE)\s*([0-9/\.\-:]+)\s+\d+",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if m_cdp:
+            dev_tok, p_pref, p_num = m_cdp.groups()
+            nbr_dev = dev_tok or prev_dev
+            prev_dev = ""
+            if nbr_dev:
+                n_clean = clean_hostname(nbr_dev)
+                l_intf = f"{p_pref}{p_num}"
+                k = (n_clean.upper(), shorten_interface_name(l_intf))
+                if n_clean and k not in seen:
+                    seen.add(k)
+                    nbrs.append({
+                        "protocol": "CDP",
+                        "neighbor_id": n_clean,
+                        "neighbor_ip": "",
+                        "local_interface": l_intf,
+                        "remote_interface": "",
+                        "state": "Up",
+                        "uptime": "CDP",
+                    })
+        else:
+            prev_dev = ""
+
+    return nbrs
 
 
 # =====================================================================
@@ -969,6 +1122,7 @@ def poll_single_device(
                         ospf_out = conn.send_command("display ospf peer brief")
                         isis_out = conn.send_command("display isis peer")
                         isis_self_out = conn.send_command("display isis brief")
+                        lldp_out = conn.send_command("display lldp neighbor brief")
 
                         local_ips = parse_local_ips(ip_brief)
                         local_ips |= extract_router_ids_from_output(ospf_out)
@@ -977,6 +1131,7 @@ def poll_single_device(
                         local_ips.add(ip)
                         isis_neighbors = parse_isis_adjacency(isis_out)
                         ospf_neighbors = parse_ospf_neighbors(ospf_out)
+                        lldp_neighbors = parse_lldp_cdp_neighbors(lldp_out)
 
                         # Huawei Eth-Trunk sürətlərinin toplanması
                         bundle_bw_map: Dict[str, str] = {}
@@ -1019,11 +1174,16 @@ def poll_single_device(
                             "local_ips": sorted(local_ips),
                             "isis_neighbors": isis_neighbors,
                             "ospf_neighbors": ospf_neighbors,
+                            "lldp_neighbors": lldp_neighbors,
                             "bundle_bw_map": bundle_bw_map,
                             "bundle_members_map": bundle_members_map,
                         }
 
                     # Cisco (IOS-XR / IOS-XE / IOS) cihazı:
+                    try:
+                        conn.send_command("terminal width 512", expect_string=r"[>#]", read_timeout=3)
+                    except Exception:
+                        pass
                     if not is_xr_prompt and dev_type != "cisco_xr":
                         try:
                             conn.enable()
@@ -1064,8 +1224,11 @@ def poll_single_device(
 
                     local_ips = parse_local_ips(ip_brief)
                     local_ips.add(ip)
+                    lldp_out = conn.send_command("show lldp neighbors")
+                    cdp_out = conn.send_command("show cdp neighbors")
                     isis_neighbors = parse_isis_adjacency(isis_out)
                     ospf_neighbors = parse_ospf_neighbors(ospf_out)
+                    lldp_neighbors = parse_lldp_cdp_neighbors(lldp_out, cdp_out)
 
                     detected_ncs = bool(is_xr_prompt or (is_ncs is True) or ("NCS" in hostname.upper()))
 
@@ -1121,6 +1284,7 @@ def poll_single_device(
                         "local_ips": sorted(local_ips),
                         "isis_neighbors": isis_neighbors,
                         "ospf_neighbors": ospf_neighbors,
+                        "lldp_neighbors": lldp_neighbors,
                         "bundle_bw_map": bundle_bw_map,
                         "bundle_members_map": bundle_members_map,
                     }
@@ -1254,6 +1418,8 @@ def collect_all_devices_parallel(
                             existing_isis_keys.add(k)
                             existing["isis_neighbors"].append(adj)
 
+                    for lnbr in dev_info.get("lldp_neighbors", []):
+                        existing.setdefault("lldp_neighbors", []).append(lnbr)
                     existing_ospf_keys = {(n["neighbor_id"], n["neighbor_ip"], shorten_interface_name(n["local_interface"])) for n in existing["ospf_neighbors"]}
                     for nbr in dev_info["ospf_neighbors"]:
                         k = (nbr["neighbor_id"], nbr["neighbor_ip"], shorten_interface_name(nbr["local_interface"]))
@@ -1340,7 +1506,7 @@ def build_unified_topology(
         if alnum_a and len(alnum_a) >= 4:
             alnum_to_host[alnum_a] = canonical_host
 
-    def resolve_canonical_host(raw_name: str, nbr_ip: str = "") -> Optional[str]:
+    def resolve_canonical_host(raw_name: str, nbr_ip: str = "", exclude_host: str = "") -> Optional[str]:
         for candidate in (raw_name, nbr_ip):
             if not candidate:
                 continue
@@ -1369,7 +1535,7 @@ def build_unified_topology(
                     return alnum_to_host[alnum_c]
                 matches = [
                     h for k_alnum, h in alnum_to_host.items()
-                    if len(k_alnum) >= 4 and (k_alnum.endswith(alnum_c) or alnum_c.endswith(k_alnum))
+                    if h != exclude_host and len(k_alnum) >= 4 and (k_alnum.endswith(alnum_c) or alnum_c.endswith(k_alnum))
                 ]
                 if len(set(matches)) == 1:
                     return matches[0]
@@ -1385,11 +1551,15 @@ def build_unified_topology(
                 ospf_by_intf: Dict[str, List[Dict]] = defaultdict(list)
 
                 for adj in dev_a["isis_neighbors"]:
+                    if strip_flag and "." in str(adj.get("local_interface", "")):
+                        continue
                     ik = canonical_interface_key(adj["local_interface"], strip_sub=strip_flag)
                     if ik:
                         isis_by_intf[ik].append(adj)
 
                 for nbr in dev_a["ospf_neighbors"]:
+                    if strip_flag and "." in str(nbr.get("local_interface", "")):
+                        continue
                     ik = canonical_interface_key(nbr["local_interface"], strip_sub=strip_flag)
                     if ik:
                         ospf_by_intf[ik].append(nbr)
@@ -1578,7 +1748,7 @@ def build_unified_topology(
         for adj in dev_a["isis_neighbors"]:
             raw_id = clean_hostname(adj["neighbor_id"])
             nbr_ip = adj.get("neighbor_ip", "").strip() or (decode_isis_bcd_sysid_to_ip(raw_id) or "")
-            resolved = resolve_canonical_host(raw_id, nbr_ip)
+            resolved = resolve_canonical_host(raw_id, nbr_ip, exclude_host=host_a)
             if not resolved:
                 cand_key = raw_id if is_clean_hostname(raw_id) else (nbr_ip or raw_id)
                 resolved = _ensure_unpolled_node(cand_key, raw_id, nbr_ip, host_a, is_isis_nbr=True)
@@ -1616,7 +1786,7 @@ def build_unified_topology(
         for nbr in dev_a["ospf_neighbors"]:
             nbr_id = nbr["neighbor_id"].strip()
             nbr_ip = nbr.get("neighbor_ip", "").strip()
-            resolved = resolve_canonical_host(nbr_id, nbr_ip)
+            resolved = resolve_canonical_host(nbr_id, nbr_ip, exclude_host=host_a)
             if not resolved:
                 cand_key = f"OSPF_{nbr_id}"
                 resolved = _ensure_unpolled_node(cand_key, nbr_id, nbr_ip or nbr_id, host_a, is_isis_nbr=False)
@@ -1655,15 +1825,97 @@ def build_unified_topology(
             if nbr.get("state") and not rec["has_isis"]:
                 rec["state"] = nbr["state"]
 
-    # 2c. Hər cihaz cütü üçün TƏK bir link obyekti yarat
+    # 2b-bis. LLDP / CDP Ehtiyat Bağlantıları (yalnız IS-IS/OSPF qonşuluğu tapılmayan boş qovşaqlar üçün)
+    connected_hosts: Set[str] = set()
+    for (h1, h2) in pair_records:
+        connected_hosts.add(h1)
+        connected_hosts.add(h2)
+
+    for host_a, dev_a in discovered_devices.items():
+        bw_map_a = dev_a.get("bundle_bw_map", {})
+        for lnbr in dev_a.get("lldp_neighbors", []):
+            raw_id = clean_hostname(lnbr.get("neighbor_id", ""))
+            if not raw_id:
+                continue
+            resolved = resolve_canonical_host(raw_id, "", exclude_host=host_a)
+            if not resolved or resolved == host_a:
+                continue
+            # Yalnız ən azı bir tərəfin L3 linki yoxdursa (boşda qalan cihazdırsa) LLDP/CDP linkini əlavə et
+            if host_a in connected_hosts and resolved in connected_hosts:
+                continue
+            pair_k = tuple(sorted([host_a, resolved]))
+            if pair_k in pair_records:
+                continue
+            rec = _get_or_create_pair_rec(host_a, resolved)
+            rec["has_lldp"] = lnbr.get("protocol", "LLDP")
+            intf_a = shorten_interface_name(lnbr.get("local_interface", ""))
+            if intf_a and intf_a not in rec["intfs_by_host"][host_a]:
+                rec["intfs_by_host"][host_a].append(intf_a)
+            bw_a = resolve_interface_bandwidth(intf_a, bw_map_a)
+            if bw_a and not rec["bandwidth"]:
+                rec["bandwidth"] = bw_a
+            rec["uptime"] = lnbr.get("protocol", "LLDP")
+            connected_hosts.add(host_a)
+            connected_hosts.add(resolved)
+
+    # 2c. ATS Stansiya Qruplaşdırması və F1 -> M14 Bağlantı Düzəlişi ("f1 olanlar m14 e qosulsun")
+    # Hər qovşağın ATS kodunu ('374', '431', '432' və s.) müəyyən et
+    for nid, n in nodes.items():
+        ats_c = extract_ats_site_code(nid) or extract_ats_site_code(n.get("label", ""))
+        n["ats_code"] = ats_c
+
+    # Hər ATS kodu üzrə mövcud M14 cihazlarını tap
+    site_to_m14s: Dict[str, List[str]] = defaultdict(list)
+    all_m14s: List[str] = []
+    for nid, n in nodes.items():
+        if n.get("hw_role") == "m14_agg":
+            all_m14s.append(nid)
+            if n.get("ats_code"):
+                site_to_m14s[n["ats_code"]].append(nid)
+
+    # Əgər hər hansı F1 cihazı həm NE40 (Core), həm də öz M14-ü ilə (və ya eyni ATS-dəki M14 ilə)
+    # qonşuluq çıxarıbsa (məs: ortaq VLAN / OSPF sahəsi səbəbindən), F1-i birbaşa M14-ə bağla!
+    f1_parent_map: Dict[str, str] = {}
+    for nid, n in nodes.items():
+        if n.get("hw_role") == "f1_access" or (n.get("role") == "deg3_access" and n.get("hw_role") not in ("m14_agg", "core")):
+            ats_c = n.get("ats_code", "")
+            candidate_m14s = site_to_m14s.get(ats_c, []) if ats_c else []
+            chosen_m14 = None
+            # 1) Artıq linki olan eyni ATS-li M14 varsa, onu seç
+            for m_id in candidate_m14s:
+                if tuple(sorted([nid, m_id])) in pair_records:
+                    chosen_m14 = m_id
+                    break
+            # 2) Yoxdursa, eyni ATS-dəki ilk M14-ü seç (məs: ATS431F1 -> ATS431M14)
+            if not chosen_m14 and candidate_m14s:
+                chosen_m14 = candidate_m14s[0]
+            # 3) ATS kodu yoxdursa amma birbaşa hansısa M14 ilə linki varsa, həmin M14-ü seç
+            if not chosen_m14:
+                for m_id in all_m14s:
+                    if tuple(sorted([nid, m_id])) in pair_records:
+                        chosen_m14 = m_id
+                        break
+            if chosen_m14 and chosen_m14 != nid:
+                f1_parent_map[nid] = chosen_m14
+                n["parent_m14"] = chosen_m14
+                n["tier"] = 4
+                if not n.get("ats_code") and nodes[chosen_m14].get("ats_code"):
+                    n["ats_code"] = nodes[chosen_m14]["ats_code"]
+
+    # QEYD: Heç bir real aşkarlanmış bağlantı (`pair_records`) silinmir!
+    # `f1_parent_map` yalnız F1 cihazlarının düzülüşdə öz M14 qrupunun yanında yerləşdirilməsi üçün istifadə olunur.
+
+    # 2d. Hər cihaz cütü üçün TƏK bir link obyekti yarat
     links: List[Dict] = []
     for (h1, h2), rec in pair_records.items():
         if rec["has_isis"] and rec["has_ospf"]:
             proto = "OSPF+IS-IS"
         elif rec["has_isis"]:
             proto = "IS-IS"
-        else:
+        elif rec["has_ospf"]:
             proto = "OSPF"
+        else:
+            proto = rec.get("has_lldp", "LLDP")
 
         i1_list = rec["intfs_by_host"].get(h1, [])
         i2_list = rec["intfs_by_host"].get(h2, [])
@@ -1694,14 +1946,11 @@ def build_unified_topology(
         })
 
     # ---------------- 3. NE40 -> M14 -> F1 Mərtəbə (Tier) Dəqiqləşdirməsi ----------------
-    # - `M14` cihazları həmişə Tier 3 (ACCESS L1 / AGG M14) qatında qalır.
-    # - `F1` cihazları (və ya `NE40`-a birbaşa qoşulmayıb `M14` üzərindən qoşulan cihazlar)
-    #   həmişə Tier 4 (ACCESS L2 / F1) qatında yerləşir!
     for nid, n in nodes.items():
         hw_r = n.get("hw_role", "other")
         if hw_r == "m14_agg":
             n["tier"] = 3
-        elif hw_r == "f1_access":
+        elif hw_r == "f1_access" or nid in f1_parent_map:
             n["tier"] = 4
         elif n["role"] == "deg3_access" and n["tier"] == 3:
             if nid not in directly_connected_to_core:
@@ -1732,12 +1981,12 @@ def build_unified_topology(
 # =====================================================================
 
 INCH_PER_UNIT = 0.30   # 1 koordinat vahidi = 0.30 düym
-H_GAP = 5.6            # eyni sətirdə qutular arası GENİŞ üfüqi boşluq (xətlərin rahat keçməsi üçün)
+H_GAP = 5.4            # eyni sətirdə qutular arası GENİŞ üfüqi boşluq (xətlərin rahat keçməsi üçün)
 V_GAP = 4.6            # eyni təbəqənin alt-sətirləri arası şaquli boşluq
 LAYER_GAP = 6.2        # təbəqələr arası GENİŞ şaquli boşluq (ortoqonal xətlər və BW nişanları üçün)
 LANE_STEP = 0.82       # paralel üfüqi xətt zolaqları (lane) arası geniş məsafə
 PORT_SP = 0.68         # şaquli xətlər və portlar arası minimum məsafə (üst-üstə düşmə = 0)
-MAX_COLS = 100          # bir sətirdə maksimum cihaz (geniş topologiya üçün 16 sütun)
+MAX_COLS = 60          # bir sətirdə maksimum cihaz (geniş topologiya üçün 16 sütun)
 
 
 def node_style(n: Dict) -> Dict:
@@ -1867,7 +2116,11 @@ def _band_label(tiers: Set[int]) -> str:
     if 0 in tiers:
         return "REMOTE CORE"
     if tiers & {1, 2}:
-        return "CORE NCS"
+        return "CORE (NE40 / NCS)"
+    if 3 in tiers:
+        return "DISTRIBUTION (M14)"
+    if 4 in tiers:
+        return "ACCESS (F1)"
     return f"ACCESS L{min(tiers) - 2}"
 
 
@@ -1896,16 +2149,18 @@ def compute_layer_columns(
             nbrs[t].add(s)
 
     total = len(nodes)
-    max_cols = max(MAX_COLS, total)
+    max_cols = MAX_COLS if total <= 48 else MAX_COLS + 4
     rows = [max(1, math.ceil(len(lay) / max_cols)) for lay in layers]
     cells = [max(sizes[v][0] for v in lay) + H_GAP for lay in layers]
 
     grp = {nid: _ip_group(n, nid) for nid, n in nodes.items()}
 
     def order_layer(lay: List[str], des: Dict[str, float]) -> List[str]:
-        # Hər bir F1 / alt cihazı birbaşa öz valideyn M14 / Core cihazının X koordinatına (`des[v]`)
-        # görə sırala ki, hər M14-ün 3-4 F1 qolu tam öz altında yan-yana düzülsün!
-        return sorted(lay, key=lambda v: (round(des[v], 2), grp[v], xs.get(v, 0.0), v))
+        acc: Dict[str, List[float]] = defaultdict(list)
+        for v in lay:
+            acc[grp[v]].append(des[v])
+        gmean = {k: sum(x) / len(x) for k, x in acc.items()}
+        return sorted(lay, key=lambda v: (gmean[grp[v]], grp[v], des[v], xs.get(v, 0.0), v))
 
     xs: Dict[str, float] = {}
     subs: Dict[str, int] = {}
@@ -1919,8 +2174,57 @@ def compute_layer_columns(
         subs.update(s)
         layers[i] = order
 
+    def _optimize_horizontal_chain(lay: List[str]) -> List[str]:
+        """
+        Eyni təbəqədə (məs: Core sətirində) bir-birinə birbaşa bağlı olan cihazları
+        yan-yana düzür ki, aradakı cihazların üstündən atlayan ('arc') və digər xətləri
+        kəsən bağlantılar (məs: Link 6) yaranmasın!
+        """
+        if len(lay) <= 2:
+            return lay
+        lay_set = set(lay)
+        same_edges = [
+            (u, v) for u in lay for v in nbrs[u] if v in lay_set and u < v
+        ]
+        if not same_edges:
+            return lay
+        if len(lay) <= 8:
+            import itertools
+            best_perm = tuple(lay)
+            best_score = None
+            for perm in itertools.permutations(lay):
+                idx_map = {n_id: idx for idx, n_id in enumerate(perm)}
+                arc_cnt = sum(1 for u, v in same_edges if abs(idx_map[u] - idx_map[v]) > 1)
+                span_sum = sum(abs(idx_map[u] - idx_map[v]) for u, v in same_edges)
+                # Yuxarı (Remote Core) qonşuları olan qovşaqları yan-yana saxla
+                up_idxs = [idx_map[n_id] for n_id in lay if any(layer_idx[u] < layer_idx[n_id] for u in nbrs[n_id])]
+                up_spread = (max(up_idxs) - min(up_idxs)) if len(up_idxs) >= 2 else 0
+                score = (arc_cnt, span_sum, up_spread, perm)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_perm = perm
+            return list(best_perm)
+
+        # 8-dən çox cihaz olduqda acgöz (greedy) zəncir sıralaması
+        adj_in = {u: sorted([v for v in nbrs[u] if v in lay_set]) for u in lay}
+        visited: Set[str] = set()
+        result: List[str] = []
+        starts = sorted(lay, key=lambda u: (len(adj_in[u]) == 0, len(adj_in[u]), u))
+        for st in starts:
+            if st in visited:
+                continue
+            curr = st
+            while curr is not None and curr not in visited:
+                visited.add(curr)
+                result.append(curr)
+                nxt = next((v for v in adj_in[curr] if v not in visited), None)
+                curr = nxt
+        return result
+
     for i, lay in enumerate(layers):
-        if i not in fixed:
+        if i in fixed:
+            lay = _optimize_horizontal_chain(lay)
+        else:
             lay = sorted(lay, key=lambda v: (grp[v], v))
         arrange(i, lay, {v: k * cells[i] for k, v in enumerate(lay)}, center=True)
 
@@ -2104,7 +2408,10 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
             if abs(e["xb"] - xc) > 0.02:
                 e["lanes"].append((rb - 1, xc, e["xb"], "L2"))
 
-    # --- 4. Üfüqi zolaqların (lane) paylanması: hər kəsişən/yaxın xətt FƏRQLİ Y zolağına düşür ---
+    # --- 4. Üfüqi zolaqların (lane) simmetrik və kəsişməsiz paylanması ---
+    # Həm sol, həm də sağ tərəfdə ən uzun (ən kənar) xətlər eyni qayda ilə düzülür:
+    #   - Yuxarıdan aşağıya budaqlanmada (fan-out): ən uzun xətlər ən YUXARI zolağa düşür -> 0 kəsişmə!
+    #   - Yuxarıdan bir mərkəzə yığılmada (fan-in): ən uzun xətlər ən AŞAĞI zolağa düşür -> 0 kəsişmə!
     chan_items: Dict[int, List[Tuple[float, float, Tuple[int, str]]]] = defaultdict(list)
     for e in E:
         for ch, x1, x2, tag in e["lanes"]:
@@ -2114,20 +2421,25 @@ def _route_edges(nodes, links, sizes, xs, row_of, rows):
     lane_idx: Dict[Tuple[int, str], int] = {}
     nlanes: Dict[int, int] = {}
     for ch, items in chan_items.items():
-        # Uzun üfüqi seqmentləri əvvəl yerləşdir ki, qısa seqmentlərlə kəsişmə az olsun
-        items.sort(key=lambda it: (it[0], -(it[1] - it[0])))
-        ends: List[float] = []
+        # Ən uzun üfüqi seqmentləri əvvəl yerləşdir (simmetrik sol/sağ zolaqlar)
+        items.sort(key=lambda it: (-(it[1] - it[0]), it[0]))
+        lane_intervals: List[List[Tuple[float, float]]] = []
         for x1, x2, key in items:
-            for j, en in enumerate(ends):
-                # 1.6 vahid üfüqi təhlükəsizlik буferi (heç vaxt yaxın üfüqi xətlər eyni zolağı paylaşmır)
-                if en + 1.6 <= x1:
-                    ends[j] = x2
+            for j, ivs in enumerate(lane_intervals):
+                if all(x2 + 1.6 <= ix1 or ix2 + 1.6 <= x1 for ix1, ix2 in ivs):
+                    ivs.append((x1, x2))
                     lane_idx[key] = j
                     break
             else:
-                ends.append(x2)
-                lane_idx[key] = len(ends) - 1
-        nlanes[ch] = len(ends)
+                lane_intervals.append([(x1, x2)])
+                lane_idx[key] = len(lane_intervals) - 1
+        nl = len(lane_intervals)
+        nlanes[ch] = nl
+        # Əgər yuxarı sətirdə aşağı sətirdən daha çox qutu varsa (fan-in: yuxarıdan mərkəzə),
+        # zolaqları tərsinə çevir ki, kənar xətlər aşağıdan, daxili xətlər yuxarıdan keçsin!
+        if 0 <= ch < nrows - 1 and len(rows[ch]["nodes"]) > len(rows[ch + 1]["nodes"]):
+            for _x1, _x2, key in items:
+                lane_idx[key] = (nl - 1) - lane_idx[key]
 
     # --- 5. Şaquli yerləşdirmə (kanal hündürlüyü zolaq sayına görə avtomatik böyüyür) ---
     chan_h: Dict[int, float] = {}
@@ -2252,7 +2564,7 @@ def export_drawio(nodes, links, pos, sizes, paths, bands, out_path: Path) -> Non
 
     for bi, b in enumerate(bands):
         cells.append(
-            f'<mxCell id="band{bi}" value={quoteattr(b["label"])} vertex="1" parent="1" '
+            f'<mxCell id="band{bi}" value="" vertex="1" parent="1" '
             f'style="rounded=0;html=1;fillColor=#111B33;strokeColor=#1E293B;fontColor=#64748B;fontStyle=1;'
             f'fontSize=12;align=left;verticalAlign=top;spacingLeft=8;spacingTop=4;">'
             f'<mxGeometry x="{X(x_lo + 0.4)}" y="{Y(b["top"] + 0.8)}" '
@@ -2350,15 +2662,42 @@ def export_drawio(nodes, links, pos, sizes, paths, bands, out_path: Path) -> Non
     print(f"[+] draw.io faylı yaradıldı: {out_path}")
 
 
+def apply_node_ip_visibility(nodes: Dict[str, Dict], show_ips: bool = True) -> Dict[str, Dict]:
+    """
+    `show_ips=True` olduqda qutularda `Hostname\nIP`, `show_ips=False` olduqda isə
+    yalnız `Hostname` göstərir (əgər qovşağın adı yalnız IP-dirsə, IP saxlanılır).
+    """
+    updated: Dict[str, Dict] = {}
+    for nid, n in nodes.items():
+        n_copy = dict(n)
+        mgmt_ip = (n.get("mgmt_ip") or "").strip()
+        raw_lbl = n.get("label", nid)
+        base_name = raw_lbl.splitlines()[0].strip() if raw_lbl else nid
+        if show_ips:
+            if mgmt_ip and base_name != mgmt_ip and is_clean_hostname(base_name):
+                n_copy["label"] = f"{base_name}\n{mgmt_ip}"
+            else:
+                n_copy["label"] = raw_lbl
+        else:
+            if is_clean_hostname(base_name):
+                n_copy["label"] = base_name
+            else:
+                n_copy["label"] = mgmt_ip or base_name
+        updated[nid] = n_copy
+    return updated
+
+
 def generate_image_weathermap(
     nodes: Dict[str, Dict],
     links: List[Dict],
     png_path: Path,
+    show_ips: bool = True,
 ) -> None:
     """
     Yüksək keyfiyyətli PNG Weather Map. Qatlı (REMOTE CORE -> CORE -> ACCESS L1 -> L2) düzülüş,
     qutular və nömrələr heç vaxt üst-üstə düşmür, şəkil ölçüsü cihaz sayına görə avtomatik böyüyür.
     """
+    nodes = apply_node_ip_visibility(nodes, show_ips=show_ips)
     sizes = widen_for_ports(nodes, links, measure_box_sizes(nodes))
     pos, bands, paths = build_layout(nodes, links, sizes)
     export_drawio(nodes, links, pos, sizes, paths, bands, Path(png_path).with_suffix(".drawio"))
@@ -2366,7 +2705,7 @@ def generate_image_weathermap(
     # ---------------- Ölçülər və Figure ----------------
     x_lo = min(pos[n][0] - sizes[n][0] / 2 for n in pos)
     x_hi = max(pos[n][0] + sizes[n][0] / 2 for n in pos)
-    xlim0, xlim1 = x_lo - 4.0, x_hi + 1.6
+    xlim0, xlim1 = x_lo - 1.8, x_hi + 1.6
     min_w = 12.5 / INCH_PER_UNIT
     if xlim1 - xlim0 < min_w:
         extra = (min_w - (xlim1 - xlim0)) / 2.0
@@ -2390,7 +2729,7 @@ def generate_image_weathermap(
     margin, gap, top_room, bottom_room = 0.3, 0.5, 1.4, 1.1
     fig_w = margin + ax_w + gap + list_w + margin
     fig_h = max(ax_h, list_h) + top_room + bottom_room
-    dpi = max(90, min(280, int(min(28000.0 / max(1.0, fig_w), 28000.0 / max(1.0, fig_h), (6.5e7 / max(1.0, fig_w * fig_h)) ** 0.5))))
+    dpi = max(110, min(300, int((6.0e7 / (fig_w * fig_h)) ** 0.5)))
 
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi, facecolor="#0B1120")
     ax = fig.add_axes([margin / fig_w, (fig_h - top_room - ax_h) / fig_h, ax_w / fig_w, ax_h / fig_h])
@@ -2407,13 +2746,12 @@ def generate_image_weathermap(
             (xlim0 + 0.4, b["bottom"] - 0.8), (xlim1 - xlim0) - 0.8, (b["top"] - b["bottom"]) + 1.6,
             facecolor="#111B33" if bi % 2 == 0 else "#0E1730", edgecolor="#1E293B", linewidth=1.0, zorder=0,
         ))
-        ax.text(
-            xlim0 + 1.5, (b["top"] + b["bottom"]) / 2.0, b["label"], rotation=90, ha="center", va="center",
-            fontsize=9.5, fontweight="bold", color="#64748B", fontfamily="DejaVu Sans", zorder=1,
-        )
+
 
     # ---------------- Xətləri çək (ortoqonal, yumru künclü) ----------------
     def rounded_path(pts, r=0.28):
+        if len(pts) <= 2:
+            return MplPath(pts, [MplPath.MOVETO] + [MplPath.LINETO] * (len(pts) - 1))
         verts = [pts[0]]
         codes = [MplPath.MOVETO]
         for i in range(1, len(pts) - 1):
@@ -2430,10 +2768,6 @@ def generate_image_weathermap(
         return MplPath(verts, codes)
 
     def split_polyline_in_half(pts_list: List[Tuple[float, float]]) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-        """
-        Ortoqonal xətti (polyline) həndəsi uzunluğuna görə tam ortadan (50% / 50%) iki hissəyə bölür:
-        1-ci yarısı Narıncı (IS-IS), 2-ci yarısı Mavi (OSPF) rəngdə çəkilməsi üçün.
-        """
         if len(pts_list) < 2:
             return pts_list, pts_list
         seg_lens = [
@@ -2452,9 +2786,7 @@ def generate_image_weathermap(
                 mx = pts_list[i][0] + t * (pts_list[i + 1][0] - pts_list[i][0])
                 my = pts_list[i][1] + t * (pts_list[i + 1][1] - pts_list[i][1])
                 mid_pt = (mx, my)
-                first_half = pts_list[:i + 1] + [mid_pt]
-                second_half = [mid_pt] + pts_list[i + 1:]
-                return first_half, second_half
+                return pts_list[:i + 1] + [mid_pt], [mid_pt] + pts_list[i + 1:]
             acc += slen
         return pts_list, pts_list
 
@@ -2462,44 +2794,24 @@ def generate_image_weathermap(
         link = links[li]
         proto = link["protocol"]
         lstyle = "solid" if link["state"].upper().startswith(("UP", "FULL")) else "dashed"
-
         if proto == "OSPF+IS-IS":
-            # Xəttin yarısı Narıncı (IS-IS), digər yarısı Mavi (OSPF)!
             half1, half2 = split_polyline_in_half(pts)
             ax.add_patch(PathPatch(
-                rounded_path(half1),
-                facecolor="none",
-                edgecolor="#FF5722",
-                linewidth=2.8,
-                linestyle=lstyle,
-                alpha=0.96,
-                zorder=2,
-                capstyle="butt",
-                joinstyle="round",
+                rounded_path(half1), facecolor="none", edgecolor="#FF5722",
+                linewidth=2.9, linestyle=lstyle, alpha=0.96, zorder=2,
+                capstyle="butt", joinstyle="round",
             ))
             ax.add_patch(PathPatch(
-                rounded_path(half2),
-                facecolor="none",
-                edgecolor="#00B0FF",
-                linewidth=2.8,
-                linestyle=lstyle,
-                alpha=0.96,
-                zorder=2,
-                capstyle="butt",
-                joinstyle="round",
+                rounded_path(half2), facecolor="none", edgecolor="#00B0FF",
+                linewidth=2.9, linestyle=lstyle, alpha=0.96, zorder=2,
+                capstyle="butt", joinstyle="round",
             ))
         else:
             is_isis = (proto == "IS-IS")
             ax.add_patch(PathPatch(
-                rounded_path(pts),
-                facecolor="none",
-                edgecolor="#FF5722" if is_isis else "#00B0FF",
-                linewidth=2.8 if is_isis else 2.3,
-                linestyle=lstyle,
-                alpha=0.95,
-                zorder=2,
-                capstyle="round",
-                joinstyle="round",
+                rounded_path(pts), facecolor="none", edgecolor="#FF5722" if is_isis else "#00B0FF",
+                linewidth=2.8 if is_isis else 2.3, linestyle=lstyle, alpha=0.95, zorder=2,
+                capstyle="round", joinstyle="round",
             ))
 
     # ---------------- Xətt üzərində Nömrə + Bandwidth nişanları (2 cihaz arasında 1 yerdə) ----------------
@@ -2554,15 +2866,16 @@ def generate_image_weathermap(
         lnum_str = str(links[li]["link_num"])
         bw_str = links[li].get("bandwidth", "")
         badge_text = f"{lnum_str} | {bw_str}" if bw_str else lnum_str
-        b_style = "round,pad=0.26,rounding_size=0.45" if bw_str else "circle,pad=0.32"
-        b_face = "#38BDF8" if (is_dual or not is_isis) else "#FF7043"
-        b_edge = "#FF5722" if is_dual else "#FFFFFF"
-        b_lw = 2.2 if is_dual else 1.25
         ax.text(
             best[0], best[1], badge_text,
             fontsize=8.6 if bw_str else 9.5, fontfamily="DejaVu Sans", fontweight="bold", color="#0B1120",
             ha="center", va="center", zorder=4,
-            bbox=dict(boxstyle=b_style, facecolor=b_face, edgecolor=b_edge, linewidth=b_lw),
+            bbox=dict(
+                boxstyle="round,pad=0.26,rounding_size=0.45" if bw_str else "circle,pad=0.32",
+                facecolor="#38BDF8" if (is_dual or not is_isis) else "#FF7043",
+                edgecolor="#FF5722" if is_dual else "#FFFFFF",
+                linewidth=2.1 if is_dual else 1.25,
+            ),
         )
 
     # ---------------- Cihaz qutuları (Hostname + IP) ----------------
@@ -2590,7 +2903,7 @@ def generate_image_weathermap(
     dual_part = f", OSPF+IS-IS: {dual_count}" if dual_count else ""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     ax.set_title(
-        "L2/L3 ROUTING WEATHER MAP (CISCO & HUAWEI)\n"
+        "L2/L3 ROUTING WEATHER MAP (CISCO & HUAWEI — TREE LAYOUT)\n"
         f"Cihaz sayı: {len(nodes)}  |  Ümumi Bağlantı (Link): {len(links)} "
         f"(IS-IS: {isis_count}, OSPF: {ospf_count}{dual_part})  |  Tarix: {now_str}",
         fontsize=14, fontweight="bold", color="#F8FAFC", pad=18,
@@ -2600,16 +2913,16 @@ def generate_image_weathermap(
         Line2D([0], [0], color="#00B0FF", lw=2.8, label="OSPF Bağlantısı (Mavi)"),
         Line2D([0], [0], color="#00B0FF", marker="o", markerfacecolor="#FF5722", markeredgecolor="#FFFFFF",
                markersize=8, lw=3.0, label="OSPF + IS-IS (Yarı Narıncı / Yarı Mavi)"),
-        Line2D([0], [0], marker="s", color="#0B1120", label="Əsas Core (.100.)",
+        Line2D([0], [0], marker="s", color="#0B1120", label="Core (NE40 / NCS)",
                markerfacecolor="#1E1B4B", markeredgecolor="#FACC15", markersize=11),
-        Line2D([0], [0], marker="s", color="#0B1120", label="Mərkəz Core",
-               markerfacecolor="#2E1065", markeredgecolor="#C084FC", markersize=11),
-        Line2D([0], [0], marker="s", color="#0B1120", label="Access (Cisco ASR / Huawei)",
-               markerfacecolor="#0F172A", markeredgecolor="#00B0FF", markersize=11),
+        Line2D([0], [0], marker="s", color="#0B1120", label="Distribution (M14)",
+               markerfacecolor="#2E1065", markeredgecolor="#00B0FF", markersize=11),
+        Line2D([0], [0], marker="s", color="#0B1120", label="Access (F1 / ASR)",
+               markerfacecolor="#0F172A", markeredgecolor="#38BDF8", markersize=11),
     ]
     ax.legend(
         handles=legend_elements, loc="upper center", bbox_to_anchor=(0.5, -0.01), ncol=6,
-        frameon=True, facecolor="#1E293B", edgecolor="#475569", fontsize=9.0, labelcolor="#F8FAFC",
+        frameon=True, facecolor="#1E293B", edgecolor="#475569", fontsize=9.2, labelcolor="#F8FAFC",
     )
     ax.axis("off")
 
@@ -2632,12 +2945,9 @@ def generate_image_weathermap(
         y_center = (total_units - 1.25) - float(row_idx) * 1.0
 
         lnum = link["link_num"]
-        proto = link["protocol"]
-        is_isis = (proto == "IS-IS")
-        is_dual = (proto == "OSPF+IS-IS")
+        is_isis = link["protocol"] == "IS-IS"
         badge_bg = "#FF7043" if is_isis else "#38BDF8"
-        badge_edge = "#FF5722" if is_dual else "#FFFFFF"
-        proto_color = "#FACC15" if is_dual else ("#FF8A65" if is_isis else "#7DD3FC")
+        proto_color = "#FF8A65" if is_isis else "#7DD3FC"
 
         src_name = link["source"].replace("OSPF_", "")
         dst_name = link["target"].replace("OSPF_", "")
@@ -2658,7 +2968,7 @@ def generate_image_weathermap(
         ax_list.text(
             x_base + 0.065, y_center, f"{lnum}", fontsize=9.0, fontweight="bold", color="#0B1120",
             ha="center", va="center", fontfamily="DejaVu Sans",
-            bbox=dict(boxstyle="circle,pad=0.28", facecolor=badge_bg, edgecolor=badge_edge, linewidth=1.8 if is_dual else 1.0),
+            bbox=dict(boxstyle="circle,pad=0.28", facecolor=badge_bg, edgecolor="#FFFFFF", linewidth=1.0),
         )
         ax_list.text(x_base + 0.125, y_center + 0.17, detail_line_1, fontsize=8.6, fontweight="bold",
                      color=proto_color, ha="left", va="center", fontfamily="DejaVu Sans")
@@ -2675,17 +2985,157 @@ def generate_image_weathermap(
     print(f"[+] PNG Weather Map şəkli yaradıldı: {png_path}")
 
 
+def export_connected_devices_excel(
+    discovered_devices: Dict[str, Dict],
+    out_path: Path,
+    nodes: Optional[Dict[str, Dict]] = None,
+) -> Path:
+    """
+    SSH ilə qoşulmuş bütün cihazların əsas qoşulma IP-sini (`mgmt_ip`), hostname-ni,
+    lokal IP-lərini, cihaz tipini və qonşu saylarını Excel (`.xlsx`) faylına yazır.
+    Əgər `openpyxl` quraşdırılmayıbsa, ehtiyat olaraq `.csv` formatında saxlayır.
+    """
+    rows_data: List[Dict] = []
+    for idx, (hostname, dev) in enumerate(sorted(discovered_devices.items(), key=lambda kv: kv[0].lower()), start=1):
+        mgmt_ip = dev.get("mgmt_ip", "")
+        local_ips = dev.get("local_ips", [])
+        hw_role, _ = classify_device_hw_tier(hostname, is_ncs_flag=bool(dev.get("is_ncs")))
+        if hw_role == "core" or dev.get("is_ncs"):
+            role_lbl = "CORE (NE40 / NCS)"
+        elif hw_role == "m14_agg":
+            role_lbl = "DISTRIBUTION (M14)"
+        elif hw_role == "f1_access":
+            role_lbl = "ACCESS (F1)"
+        elif nodes and hostname in nodes:
+            t_val = nodes[hostname].get("tier", 3)
+            role_lbl = "DISTRIBUTION" if t_val == 3 else "ACCESS"
+        else:
+            role_lbl = "ACCESS / OTHER"
+
+        rows_data.append({
+            "num": idx,
+            "hostname": hostname,
+            "mgmt_ip": mgmt_ip,
+            "os_type": dev.get("device_type", ""),
+            "role": role_lbl,
+            "local_ips": ", ".join(local_ips),
+            "local_ip_list": local_ips or ([mgmt_ip] if mgmt_ip else []),
+            "isis_cnt": len(dev.get("isis_neighbors", [])),
+            "ospf_cnt": len(dev.get("ospf_neighbors", [])),
+            "lldp_cnt": len(dev.get("lldp_neighbors", [])),
+        })
+
+    if not OPENPYXL_AVAILABLE:
+        import csv
+        csv_path = out_path.with_suffix(".csv")
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["No", "Hostname", "Qosulma IP (Mgmt IP)", "OS Tipi", "Rol", "Butun Lokal IP-ler", "IS-IS Qonsu", "OSPF Qonsu", "LLDP/CDP Qonsu"])
+            for r in rows_data:
+                writer.writerow([r["num"], r["hostname"], r["mgmt_ip"], r["os_type"], r["role"], r["local_ips"], r["isis_cnt"], r["ospf_cnt"], r["lldp_cnt"]])
+        print(f"[!] openpyxl tapılmadığı üçün CSV faylı yaradıldı: {csv_path}")
+        return csv_path
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Qoşulmuş Cihazlar"
+
+    headers = [
+        "№",
+        "Hostname",
+        "Qoşulma IP-si (Mgmt IP)",
+        "Cihaz Tipi (OS)",
+        "Rol / Səviyyə",
+        "Bütün Lokal IP-lər",
+        "IS-IS Qonşu",
+        "OSPF Qonşu",
+        "LLDP/CDP Qonşu",
+    ]
+    ws.append(headers)
+
+    header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    zebra_fill = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
+    center_align = Alignment(horizontal="center", vertical="center")
+    left_align = Alignment(horizontal="left", vertical="center")
+
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center_align
+
+    for r_idx, r in enumerate(rows_data, start=2):
+        ws.append([
+            r["num"],
+            r["hostname"],
+            r["mgmt_ip"],
+            r["os_type"],
+            r["role"],
+            r["local_ips"],
+            r["isis_cnt"],
+            r["ospf_cnt"],
+            r["lldp_cnt"],
+        ])
+        for col_idx in range(1, len(headers) + 1):
+            c = ws.cell(row=r_idx, column=col_idx)
+            c.font = Font(name="Calibri", size=10, bold=(col_idx in (2, 3)))
+            c.alignment = center_align if col_idx in (1, 4, 7, 8, 9) else left_align
+            if r_idx % 2 == 1:
+                c.fill = zebra_fill
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(2, len(rows_data) + 1)}"
+
+    for col_idx in range(1, len(headers) + 1):
+        max_len = max(len(str(ws.cell(row=ri, column=col_idx).value or "")) for ri in range(1, len(rows_data) + 2))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 4, 12), 55)
+
+    # 2-ci vərəq: Bütün IP -> Hostname xəritəsi
+    ws_map = wb.create_sheet(title="IP - Hostname Xəritəsi")
+    map_headers = ["№", "IP Ünvanı", "Hostname", "Əsas Mgmt IP"]
+    ws_map.append(map_headers)
+    for col_idx in range(1, len(map_headers) + 1):
+        cell = ws_map.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center_align
+
+    map_row = 1
+    for r in rows_data:
+        for ip_val in r["local_ip_list"]:
+            map_row += 1
+            ws_map.append([map_row - 1, ip_val, r["hostname"], r["mgmt_ip"]])
+            for col_idx in range(1, len(map_headers) + 1):
+                c = ws_map.cell(row=map_row, column=col_idx)
+                c.font = Font(name="Calibri", size=10, bold=(col_idx in (2, 3)))
+                c.alignment = center_align if col_idx == 1 else left_align
+                if map_row % 2 == 1:
+                    c.fill = zebra_fill
+
+    ws_map.freeze_panes = "A2"
+    ws_map.auto_filter.ref = f"A1:D{max(2, map_row)}"
+    for col_idx in range(1, len(map_headers) + 1):
+        max_len = max(len(str(ws_map.cell(row=ri, column=col_idx).value or "")) for ri in range(1, map_row + 1))
+        ws_map.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 4, 14), 45)
+
+    wb.save(out_path)
+    print(f"[+] Excel faylı yaradıldı (Qoşulmuş IP və Hostname-lər): {out_path}")
+    return out_path
+
+
 # =====================================================================
-# 5. DEMO REJİMİ (TE = 10Gbps VƏ BUNDLE-ETHER = 30Gbps / 20Gbps NÜMUNƏSİ)
+# 5. DEMO REJİMİ (GÜNƏŞ / DAİRƏVİ TOPOLOGİYA: NE40 -> M14 (QISA VƏ UZUN ŞÜA) -> F1)
 # =====================================================================
 
-def run_demo_mode(output_dir: Path) -> None:
+def run_demo_mode(output_dir: Path, show_ips: bool = True) -> Tuple[Dict[str, Dict], List[Dict]]:
     """
-    Test məqsədilə Huawei & Cisco `NE40 -> M14 -> F1` arxitekturasını simulyasiya edir:
-      - Mərkəzdə 2 əsas `NE40` cihazı (`Baku-Core-NE40-1`, `Baku-Core-NE40-2`)
-      - Onlardan budaqlanan `431M14` və `432M14` paylayıcı cihazları (həm OSPF, həm IS-IS olduqda
-        təkrarlanmayan tək yarı-mavi / yarı-narıncı xətt!)
-      - Hər `M14` üzərindən qoşulan 3 ədəd `F1` cihazı (`431F1-1..3`, `432F1-1..3`)
+    Test məqsədilə çoxsaylı ATS stansiyalarını (`ATS 374`, `ATS 431`, `ATS 432`, `ATS 511`, `ATS 512`, `ATS 564`)
+    əhatə edən Günəş (Solar Radial) `NE40 -> M14 -> F1` arxitekturasını simulyasiya edir:
+      - Günəş Mərkəzində 2 əsas `NE40` cihazı (`Baku-Core-NE40-1`, `Baku-Core-NE40-2`)
+      - Ondan çıxan qısa və uzun şüalarla qoşulan 6 ədəd `M14` paylayıcı cihazı (`ATS374M14`, `ATS431M14`, `ATS432M14`,
+        `ATS511M14`, `ATS512M14`, `ATS564M14`)
+      - Hər `M14` üzərindən öz ATS klasterində qoşulan 3 ədəd `F1` cihazı (cəmi 26 cihaz)
     """
     discovered_devices = {
         "Baku-Core-NE40-1": {
@@ -2694,52 +3144,19 @@ def run_demo_mode(output_dir: Path) -> None:
             "is_ncs": True,
             "is_huawei": True,
             "device_type": "huawei",
-            "local_ips": ["10.54.100.1", "10.54.0.1", "10.54.1.1"],
-            "bundle_bw_map": {"ET10": "30Gbps", "ET20": "20Gbps"},
+            "local_ips": ["10.54.100.1", "10.54.0.1"],
+            "bundle_bw_map": {"ET10": "40Gbps", "ET20": "20Gbps", "ET30": "20Gbps"},
             "isis_neighbors": [
-                {
-                    "protocol": "IS-IS",
-                    "neighbor_id": "Baku-Core-NE40-2",
-                    "neighbor_ip": "10.54.0.2",
-                    "local_interface": "Eth-Trunk10",
-                    "state": "Up",
-                    "uptime": "24w1d",
-                },
-                {
-                    "protocol": "IS-IS",
-                    "neighbor_id": "431M14",
-                    "neighbor_ip": "10.54.1.14",
-                    "local_interface": "Eth-Trunk20.4040",
-                    "state": "Up",
-                    "uptime": "12w3d",
-                },
-                {
-                    "protocol": "IS-IS",
-                    "neighbor_id": "432M14",
-                    "neighbor_ip": "10.54.1.15",
-                    "local_interface": "10GE0/1/0",
-                    "state": "Up",
-                    "uptime": "11w5d",
-                },
+                {"protocol": "IS-IS", "neighbor_id": "Baku-Core-NE40-2", "neighbor_ip": "10.54.0.2", "local_interface": "Eth-Trunk10", "state": "Up", "uptime": "24w1d"},
+                {"protocol": "IS-IS", "neighbor_id": "ATS374M14", "neighbor_ip": "10.54.1.11", "local_interface": "Eth-Trunk30.374", "state": "Up", "uptime": "18w2d"},
+                {"protocol": "IS-IS", "neighbor_id": "ATS431M14", "neighbor_ip": "10.54.1.14", "local_interface": "Eth-Trunk20.431", "state": "Up", "uptime": "12w3d"},
+                {"protocol": "IS-IS", "neighbor_id": "ATS432M14", "neighbor_ip": "10.54.1.15", "local_interface": "10GE0/1/0", "state": "Up", "uptime": "11w5d"},
+                {"protocol": "IS-IS", "neighbor_id": "ATS511M14", "neighbor_ip": "10.54.1.16", "local_interface": "10GE0/1/2", "state": "Up", "uptime": "9w4d"},
             ],
             "ospf_neighbors": [
-                {
-                    # 431M14 ilə həm IS-IS, həm OSPF var -> 2 xətt deyil, 1 yarı-narıncı/yarı-mavi xətt olacaq!
-                    "protocol": "OSPF",
-                    "neighbor_id": "10.54.1.14",
-                    "neighbor_ip": "",
-                    "local_interface": "Eth-Trunk20.4040",
-                    "state": "Full",
-                    "uptime": "12w3d",
-                },
-                {
-                    "protocol": "OSPF",
-                    "neighbor_id": "10.54.1.15",
-                    "neighbor_ip": "",
-                    "local_interface": "10GE0/1/0",
-                    "state": "Full",
-                    "uptime": "11w5d",
-                },
+                {"protocol": "OSPF", "neighbor_id": "10.54.1.11", "neighbor_ip": "", "local_interface": "GigabitEthernet0/1/0.374", "state": "Full", "uptime": "18w2d"},
+                {"protocol": "OSPF", "neighbor_id": "10.54.1.14", "neighbor_ip": "", "local_interface": "Eth-Trunk20.431", "state": "Full", "uptime": "12w3d"},
+                {"protocol": "OSPF", "neighbor_id": "10.54.1.15", "neighbor_ip": "", "local_interface": "10GE0/1/0", "state": "Full", "uptime": "11w5d"},
             ],
         },
         "Baku-Core-NE40-2": {
@@ -2749,230 +3166,70 @@ def run_demo_mode(output_dir: Path) -> None:
             "is_huawei": True,
             "device_type": "huawei",
             "local_ips": ["10.54.200.2", "10.54.0.2"],
-            "bundle_bw_map": {"ET10": "30Gbps"},
+            "bundle_bw_map": {"ET10": "40Gbps", "ET40": "20Gbps"},
             "isis_neighbors": [
-                {
-                    "protocol": "IS-IS",
-                    "neighbor_id": "Baku-Core-NE40-1",
-                    "neighbor_ip": "10.54.0.1",
-                    "local_interface": "Eth-Trunk10",
-                    "state": "Up",
-                    "uptime": "24w1d",
-                },
-                {
-                    "protocol": "IS-IS",
-                    "neighbor_id": "432M14",
-                    "neighbor_ip": "10.54.1.15",
-                    "local_interface": "10GE0/1/1",
-                    "state": "Up",
-                    "uptime": "10w2d",
-                },
-            ],
-            "ospf_neighbors": [],
-        },
-        "431M14": {
-            "hostname": "431M14",
-            "mgmt_ip": "10.54.1.14",
-            "is_ncs": False,
-            "is_huawei": True,
-            "device_type": "huawei",
-            "local_ips": ["10.54.1.14", "10.54.100.14"],
-            "bundle_bw_map": {"ET20": "20Gbps"},
-            "isis_neighbors": [
-                {
-                    "protocol": "IS-IS",
-                    "neighbor_id": "Baku-Core-NE40-1",
-                    "neighbor_ip": "10.54.100.1",
-                    "local_interface": "Eth-Trunk20.4040",
-                    "state": "Up",
-                    "uptime": "12w3d",
-                },
-                {
-                    "protocol": "IS-IS",
-                    "neighbor_id": "431F1-1",
-                    "neighbor_ip": "10.54.1.101",
-                    "local_interface": "10GE0/0/1",
-                    "state": "Up",
-                    "uptime": "6w1d",
-                },
+                {"protocol": "IS-IS", "neighbor_id": "Baku-Core-NE40-1", "neighbor_ip": "10.54.0.1", "local_interface": "Eth-Trunk10", "state": "Up", "uptime": "24w1d"},
+                {"protocol": "IS-IS", "neighbor_id": "ATS432M14", "neighbor_ip": "10.54.1.15", "local_interface": "10GE0/1/1", "state": "Up", "uptime": "10w2d"},
+                {"protocol": "IS-IS", "neighbor_id": "ATS512M14", "neighbor_ip": "10.54.1.17", "local_interface": "Eth-Trunk40.512", "state": "Up", "uptime": "14w1d"},
+                {"protocol": "IS-IS", "neighbor_id": "ATS564M14", "neighbor_ip": "10.54.1.18", "local_interface": "10GE0/2/0", "state": "Up", "uptime": "8w6d"},
             ],
             "ospf_neighbors": [
-                {
-                    "protocol": "OSPF",
-                    "neighbor_id": "10.54.100.1",
-                    "neighbor_ip": "",
-                    "local_interface": "Eth-Trunk20.4040",
-                    "state": "Full",
-                    "uptime": "12w3d",
-                },
-                {
-                    "protocol": "OSPF",
-                    "neighbor_id": "10.54.1.101",
-                    "neighbor_ip": "",
-                    "local_interface": "10GE0/0/1",
-                    "state": "Full",
-                    "uptime": "6w1d",
-                },
-                {
-                    "protocol": "OSPF",
-                    "neighbor_id": "10.54.1.102",
-                    "neighbor_ip": "",
-                    "local_interface": "10GE0/0/2",
-                    "state": "Full",
-                    "uptime": "5w4d",
-                },
-                {
-                    "protocol": "OSPF",
-                    "neighbor_id": "10.54.1.103",
-                    "neighbor_ip": "",
-                    "local_interface": "GE0/0/3",
-                    "state": "Full",
-                    "uptime": "4w2d",
-                },
-            ],
-        },
-        "432M14": {
-            "hostname": "432M14",
-            "mgmt_ip": "10.54.1.15",
-            "is_ncs": False,
-            "is_huawei": True,
-            "device_type": "huawei",
-            "local_ips": ["10.54.1.15", "10.54.100.15"],
-            "bundle_bw_map": {},
-            "isis_neighbors": [
-                {
-                    "protocol": "IS-IS",
-                    "neighbor_id": "Baku-Core-NE40-1",
-                    "neighbor_ip": "10.54.100.1",
-                    "local_interface": "10GE0/0/1",
-                    "state": "Up",
-                    "uptime": "11w5d",
-                },
-                {
-                    "protocol": "IS-IS",
-                    "neighbor_id": "Baku-Core-NE40-2",
-                    "neighbor_ip": "10.54.200.2",
-                    "local_interface": "10GE0/0/2",
-                    "state": "Up",
-                    "uptime": "10w2d",
-                },
-            ],
-            "ospf_neighbors": [
-                {
-                    "protocol": "OSPF",
-                    "neighbor_id": "10.54.100.1",
-                    "neighbor_ip": "",
-                    "local_interface": "10GE0/0/1",
-                    "state": "Full",
-                    "uptime": "11w5d",
-                },
-                {
-                    "protocol": "OSPF",
-                    "neighbor_id": "10.54.1.201",
-                    "neighbor_ip": "",
-                    "local_interface": "10GE0/0/5",
-                    "state": "Full",
-                    "uptime": "7w1d",
-                },
-                {
-                    "protocol": "OSPF",
-                    "neighbor_id": "10.54.1.202",
-                    "neighbor_ip": "",
-                    "local_interface": "10GE0/0/6",
-                    "state": "Full",
-                    "uptime": "7w1d",
-                },
-                {
-                    "protocol": "OSPF",
-                    "neighbor_id": "10.54.1.203",
-                    "neighbor_ip": "",
-                    "local_interface": "GE0/0/7",
-                    "state": "Full",
-                    "uptime": "3w5d",
-                },
-            ],
-        },
-        "431F1-1": {
-            "hostname": "431F1-1",
-            "mgmt_ip": "10.54.1.101",
-            "is_ncs": False,
-            "is_huawei": True,
-            "device_type": "huawei",
-            "local_ips": ["10.54.1.101"],
-            "bundle_bw_map": {},
-            "isis_neighbors": [
-                {"protocol": "IS-IS", "neighbor_id": "431M14", "neighbor_ip": "10.54.1.14", "local_interface": "10GE0/0/1", "state": "Up", "uptime": "6w1d"}
-            ],
-            "ospf_neighbors": [
-                {"protocol": "OSPF", "neighbor_id": "10.54.1.14", "neighbor_ip": "", "local_interface": "10GE0/0/1", "state": "Full", "uptime": "6w1d"}
-            ],
-        },
-        "431F1-2": {
-            "hostname": "431F1-2",
-            "mgmt_ip": "10.54.1.102",
-            "is_ncs": False,
-            "is_huawei": True,
-            "device_type": "huawei",
-            "local_ips": ["10.54.1.102"],
-            "bundle_bw_map": {},
-            "isis_neighbors": [],
-            "ospf_neighbors": [
-                {"protocol": "OSPF", "neighbor_id": "10.54.1.14", "neighbor_ip": "", "local_interface": "10GE0/0/1", "state": "Full", "uptime": "5w4d"}
-            ],
-        },
-        "431F1-3": {
-            "hostname": "431F1-3",
-            "mgmt_ip": "10.54.1.103",
-            "is_ncs": False,
-            "is_huawei": True,
-            "device_type": "huawei",
-            "local_ips": ["10.54.1.103"],
-            "bundle_bw_map": {},
-            "isis_neighbors": [],
-            "ospf_neighbors": [
-                {"protocol": "OSPF", "neighbor_id": "10.54.1.14", "neighbor_ip": "", "local_interface": "GE0/0/1", "state": "Full", "uptime": "4w2d"}
-            ],
-        },
-        "432F1-1": {
-            "hostname": "432F1-1",
-            "mgmt_ip": "10.54.1.201",
-            "is_ncs": False,
-            "is_huawei": True,
-            "device_type": "huawei",
-            "local_ips": ["10.54.1.201"],
-            "bundle_bw_map": {},
-            "isis_neighbors": [],
-            "ospf_neighbors": [
-                {"protocol": "OSPF", "neighbor_id": "10.54.1.15", "neighbor_ip": "", "local_interface": "10GE0/0/1", "state": "Full", "uptime": "7w1d"}
-            ],
-        },
-        "432F1-2": {
-            "hostname": "432F1-2",
-            "mgmt_ip": "10.54.1.202",
-            "is_ncs": False,
-            "is_huawei": True,
-            "device_type": "huawei",
-            "local_ips": ["10.54.1.202"],
-            "bundle_bw_map": {},
-            "isis_neighbors": [],
-            "ospf_neighbors": [
-                {"protocol": "OSPF", "neighbor_id": "10.54.1.15", "neighbor_ip": "", "local_interface": "10GE0/0/1", "state": "Full", "uptime": "7w1d"}
-            ],
-        },
-        "432F1-3": {
-            "hostname": "432F1-3",
-            "mgmt_ip": "10.54.1.203",
-            "is_ncs": False,
-            "is_huawei": True,
-            "device_type": "huawei",
-            "local_ips": ["10.54.1.203"],
-            "bundle_bw_map": {},
-            "isis_neighbors": [],
-            "ospf_neighbors": [
-                {"protocol": "OSPF", "neighbor_id": "10.54.1.15", "neighbor_ip": "", "local_interface": "GE0/0/1", "state": "Full", "uptime": "3w5d"}
+                {"protocol": "OSPF", "neighbor_id": "10.54.1.17", "neighbor_ip": "", "local_interface": "Eth-Trunk40.512", "state": "Full", "uptime": "14w1d"},
+                {"protocol": "OSPF", "neighbor_id": "10.54.1.18", "neighbor_ip": "", "local_interface": "10GE0/2/0", "state": "Full", "uptime": "8w6d"},
             ],
         },
     }
+
+    ats_specs = [
+        ("374", "10.54.1.11", "Baku-Core-NE40-1", "Eth-Trunk30.374", "20Gbps", True, True),
+        ("431", "10.54.1.14", "Baku-Core-NE40-1", "Eth-Trunk20.431", "20Gbps", True, True),
+        ("432", "10.54.1.15", "Baku-Core-NE40-1", "10GE0/1/0", "10Gbps", True, True),
+        ("511", "10.54.1.16", "Baku-Core-NE40-1", "10GE0/1/2", "10Gbps", True, False),
+        ("512", "10.54.1.17", "Baku-Core-NE40-2", "Eth-Trunk40.512", "20Gbps", True, True),
+        ("564", "10.54.1.18", "Baku-Core-NE40-2", "10GE0/2/0", "10Gbps", True, True),
+    ]
+
+    for idx_s, (ats_num, m_ip, core_peer, up_intf, bw_s, has_i, has_o) in enumerate(ats_specs, start=1):
+        m_name = f"ATS{ats_num}M14"
+        i_nbrs = [{"protocol": "IS-IS", "neighbor_id": core_peer, "neighbor_ip": "10.54.100.1" if "1" in core_peer else "10.54.200.2", "local_interface": up_intf, "state": "Up", "uptime": "12w3d"}] if has_i else []
+        o_nbrs = [{"protocol": "OSPF", "neighbor_id": "10.54.100.1" if "1" in core_peer else "10.54.200.2", "neighbor_ip": "", "local_interface": up_intf, "state": "Full", "uptime": "12w3d"}] if has_o else []
+
+        for f_idx in range(1, 4):
+            f_name = f"ATS{ats_num}F1-{f_idx}"
+            f_ip = f"10.54.{10 + idx_s}.{100 + f_idx}"
+            port_m = f"10GE0/0/{f_idx}" if f_idx <= 2 else f"GE0/0/{f_idx}"
+            if f_idx == 1:
+                i_nbrs.append({"protocol": "IS-IS", "neighbor_id": f_name, "neighbor_ip": f_ip, "local_interface": port_m, "state": "Up", "uptime": "6w1d"})
+            o_nbrs.append({"protocol": "OSPF", "neighbor_id": f_ip, "neighbor_ip": f_ip, "local_interface": port_m, "state": "Full", "uptime": "5w4d"})
+
+            discovered_devices[f_name] = {
+                "hostname": f_name,
+                "mgmt_ip": f_ip,
+                "is_ncs": False,
+                "is_huawei": True,
+                "device_type": "huawei",
+                "local_ips": [f_ip],
+                "bundle_bw_map": {},
+                "isis_neighbors": (
+                    [{"protocol": "IS-IS", "neighbor_id": m_name, "neighbor_ip": m_ip, "local_interface": "10GE0/0/1", "state": "Up", "uptime": "6w1d"}]
+                    if f_idx == 1 else []
+                ),
+                "ospf_neighbors": [
+                    {"protocol": "OSPF", "neighbor_id": m_ip, "neighbor_ip": m_ip, "local_interface": "10GE0/0/1" if f_idx <= 2 else "GE0/0/1", "state": "Full", "uptime": "5w4d"}
+                ],
+            }
+
+        discovered_devices[m_name] = {
+            "hostname": m_name,
+            "mgmt_ip": m_ip,
+            "is_ncs": False,
+            "is_huawei": True,
+            "device_type": "huawei",
+            "local_ips": [m_ip],
+            "bundle_bw_map": {"ET20": "20Gbps", "ET30": "20Gbps", "ET40": "20Gbps"},
+            "isis_neighbors": i_nbrs,
+            "ospf_neighbors": o_nbrs,
+        }
 
     ip_to_host = {}
     for h, d in discovered_devices.items():
@@ -2981,7 +3238,9 @@ def run_demo_mode(output_dir: Path) -> None:
     ncs_hosts = {"Baku-Core-NE40-1", "Baku-Core-NE40-2"}
 
     nodes, links = build_unified_topology(discovered_devices, ip_to_host, ncs_hosts)
-    generate_image_weathermap(nodes, links, output_dir / "l2_weathermap.png")
+    generate_image_weathermap(nodes, links, output_dir / "l2_weathermap.png", show_ips=show_ips)
+    export_connected_devices_excel(discovered_devices, output_dir / "connected_devices.xlsx", nodes=nodes)
+    return nodes, links
 
 
 # =====================================================================
@@ -3009,6 +3268,9 @@ class L3TopologyDesktopApp:
         self.worker_thread: Optional[threading.Thread] = None
         self.last_png_path: Optional[Path] = None
         self.last_out_dir: Optional[Path] = None
+        self.last_nodes: Optional[Dict[str, Dict]] = None
+        self.last_links: Optional[List[Dict]] = None
+        self.show_ips_var = tk.BooleanVar(value=True)
         self._preview_photo = None
 
         self._build_styles()
@@ -3393,7 +3655,7 @@ class L3TopologyDesktopApp:
 
         tk.Button(
             btn_row3,
-            text="🖼 Şəkli Tam Ekran Aç",
+            text="🖼 Şəkli Aç",
             command=self._open_image_external,
             bg="#1E293B",
             fg="#E2E8F0",
@@ -3402,7 +3664,37 @@ class L3TopologyDesktopApp:
             font=("Segoe UI", 9),
             pady=5,
             cursor="hand2",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        tk.Button(
+            btn_row3,
+            text="📊 Excel-i Aç",
+            command=self._open_excel_file,
+            bg="#1E293B",
+            fg="#38BDF8",
+            activebackground="#334155",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            pady=5,
+            cursor="hand2",
         ).pack(side=tk.RIGHT, fill=tk.X, expand=True)
+
+        btn_row4 = ttk.Frame(pad_frame, style="Card.TFrame")
+        btn_row4.pack(fill=tk.X, pady=(6, 0))
+
+        self.toggle_ip_btn = tk.Button(
+            btn_row4,
+            text="🏷 Topologiyada IP-ləri Gizlət (Hazırda Görünür)",
+            command=self._on_toggle_ips,
+            bg="#0F766E",
+            fg="#F8FAFC",
+            activebackground="#0D9488",
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            pady=6,
+            cursor="hand2",
+        )
+        self.toggle_ip_btn.pack(fill=tk.X, expand=True)
 
     def _build_right_panel(self, parent: "ttk.Frame") -> None:
         # Proqres və Status sətri
@@ -3594,7 +3886,9 @@ class L3TopologyDesktopApp:
             try:
                 self._emit_log(f"\n[*] Demo topologiya hazırlanır -> Qovluq: {out_dir.resolve()}")
                 self._emit_progress(35.0, "Demo topologiya qurulur...")
-                run_demo_mode(out_dir)
+                d_nodes, d_links = run_demo_mode(out_dir, show_ips=self.show_ips_var.get())
+                self.last_nodes = d_nodes
+                self.last_links = d_links
                 png_p = out_dir / "l2_weathermap.png"
                 self._emit_log(f"[✓] Demo PNG və draw.io faylları hazırlandı: {png_p.resolve()}")
                 self._emit_progress(100.0, f"Demo tamamlandı: {png_p.name}")
@@ -3704,11 +3998,15 @@ class L3TopologyDesktopApp:
 
                 self._emit_progress(90.0, "Addım 3/3 — Topologiya və Bandwidth xəritəsi çəkilir...")
                 nodes, links = build_unified_topology(discovered_devices, ip_to_host, ncs_hosts)
+                self.last_nodes = nodes
+                self.last_links = links
                 png_path = out_dir / "l2_weathermap.png"
-                generate_image_weathermap(nodes, links, png_path)
+                generate_image_weathermap(nodes, links, png_path, show_ips=self.show_ips_var.get())
+                excel_path = export_connected_devices_excel(discovered_devices, out_dir / "connected_devices.xlsx", nodes=nodes)
 
                 self._emit_log(f"\n[✓] TAMAMLANDI! PNG Şəkil: {png_path.resolve()}")
                 self._emit_log(f"[✓] Draw.io Faylı: {png_path.with_suffix('.drawio').resolve()}")
+                self._emit_log(f"[✓] Excel Faylı (IP & Hostname): {excel_path.resolve()}")
                 self._emit_progress(100.0, f"Tamamlandı! Cihaz: {len(nodes)}, Bağlantı: {len(links)}")
                 self.log_queue.put(("done", str(png_path)))
             except Exception as exc:
@@ -3717,6 +4015,49 @@ class L3TopologyDesktopApp:
 
         self.worker_thread = threading.Thread(target=_worker, daemon=True)
         self.worker_thread.start()
+
+    def _on_toggle_ips(self) -> None:
+        new_val = not self.show_ips_var.get()
+        self.show_ips_var.set(new_val)
+        if new_val:
+            self.toggle_ip_btn.config(
+                text="🏷 Topologiyada IP-ləri Gizlət (Hazırda Görünür)",
+                bg="#0F766E",
+            )
+            self._emit_log("[*] Topologiyada Hostname altında IP-lər GÖSTƏRİLİR.")
+        else:
+            self.toggle_ip_btn.config(
+                text="🏷 Topologiyada IP-ləri Göstər (Hazırda Gizlidir)",
+                bg="#475569",
+            )
+            self._emit_log("[*] Topologiyada Hostname altında IP-lər GİZLƏDİLDİ.")
+
+        # Əgər artıq topologiya qurulubsa, dərhal yenidən çək və önizləməni yenilə!
+        if self.last_nodes and self.last_links and self.last_png_path:
+            try:
+                generate_image_weathermap(self.last_nodes, self.last_links, self.last_png_path, show_ips=new_val)
+                self._load_preview_image(self.last_png_path)
+                self._emit_log(f"[✓] Topologiya yeniləndi: {self.last_png_path.name}")
+            except Exception as exc:
+                self._emit_log(f"[!] Yenidən çəkilmə xətası: {exc}")
+
+    def _open_excel_file(self) -> None:
+        base = self.last_out_dir or Path(self.folder_var.get().strip() or ".")
+        xlsx_p = base / "connected_devices.xlsx"
+        csv_p = base / "connected_devices.csv"
+        target = xlsx_p if xlsx_p.exists() else (csv_p if csv_p.exists() else None)
+        if not target:
+            messagebox.showinfo("Məlumat", "Hələ Excel faylı yaradılmayıb. Əvvəlcə kəşfiyyatı və ya Demo-nu işə salın.")
+            return
+        try:
+            if platform.system().lower().startswith("win"):
+                os.startfile(str(target.resolve()))
+            elif platform.system().lower() == "darwin":
+                subprocess.Popen(["open", str(target.resolve())])
+            else:
+                subprocess.Popen(["xdg-open", str(target.resolve())])
+        except Exception as exc:
+            messagebox.showerror("Xəta", f"Excel faylı açıla bilmədi: {exc}")
 
     def _open_output_folder(self) -> None:
         target = self.last_out_dir or Path(self.folder_var.get().strip() or ".")
@@ -3825,8 +4166,10 @@ def run_cli_mode(args: argparse.Namespace) -> None:
     nodes, links = build_unified_topology(discovered_devices, ip_to_host, ncs_hosts)
 
     png_path = out_dir / "l2_weathermap.png"
-    generate_image_weathermap(nodes, links, png_path)
+    generate_image_weathermap(nodes, links, png_path, show_ips=not getattr(args, "hide_ips", False))
+    excel_path = export_connected_devices_excel(discovered_devices, out_dir / "connected_devices.xlsx", nodes=nodes)
     print(f"\n[✓] PNG Weather Map şəkli hazırlandı: '{png_path.resolve()}'")
+    print(f"[✓] Excel Faylı (IP & Hostname) hazırlandı: '{excel_path.resolve()}'")
 
 
 def main() -> None:
@@ -3838,12 +4181,13 @@ def main() -> None:
     parser.add_argument("--asr-ips", nargs="*", help="Access (ASR 920/901) IP ünvanları")
     parser.add_argument("--workers", type=int, default=10, help="Paralel SSH qoşulma sayı (default: 10)")
     parser.add_argument("--output-dir", type=str, default="", help="Çıxış qovluğunun adı")
+    parser.add_argument("--hide-ips", action="store_true", help="Topologiyada Hostname altında IP-ləri gizlət")
     args = parser.parse_args()
 
     if args.demo:
         out_dir = Path(args.output_dir or ".")
         out_dir.mkdir(parents=True, exist_ok=True)
-        run_demo_mode(out_dir)
+        run_demo_mode(out_dir, show_ips=not args.hide_ips)
         return
 
     # Əgər `--cli` verilibsə və ya komanda sətrindən konkret arqumentlər ötürülübsə, yaxud ekran (DISPLAY) yoxdursa:

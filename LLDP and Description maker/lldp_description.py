@@ -12,10 +12,17 @@ import os
 import re
 import sys
 import getpass
+import traceback
 import time
 from datetime import datetime
 
-from netmiko import ConnectHandler, SSHDetect
+try:
+    from netmiko import ConnectHandler, SSHDetect
+except ImportError as _e:      # pencere ani baglanmasin: xetani goster ve ENTER gozle
+    print("XETA: netmiko modulu tapilmadi ->", _e)
+    print("Qurulum: python -m pip install -r requirements.txt   (eyni Python ile isletdiyine emin ol)")
+    input("Press ENTER to exit.")
+    sys.exit(1)
 
 try:
     from live_monitor import Monitor
@@ -431,8 +438,9 @@ def load_ips():
     path = sys.argv[1] if len(sys.argv) > 1 else "ips.txt"
     if os.path.exists(path):
         text = open(path, encoding="utf-8", errors="ignore").read()
+        print(f"IP siyahisi fayldan oxundu: {os.path.abspath(path)}")
     else:
-        print(f"{path} tapilmadi. IP-leri yapisdir, bitirmek ucun bos setir:")
+        print(f"{path} tapilmadi (axtarilan yer: {os.path.abspath(path)}). IP-leri yapisdir, bitirmek ucun bos setir:")
         lines = []
         while True:
             l = input()
@@ -458,18 +466,71 @@ def save_xlsx(path):
     out(white(f"Excel: {path}"))
 
 
+def flush_stdin():
+    """Icra zamani tesadufen basilmis ENTER/duymeleri sil ki, 'Press ENTER' sorgusu atlanmasin"""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        else:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
+def wait_enter():
+    flush_stdin()
+    try:
+        input("Press ENTER to exit.")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def ask_name(prompt):
+    try:
+        return input(prompt).strip()
+    except UnicodeDecodeError:
+        print("Ad oxuna bilmedi (simvol kodlamasi), ad olmadan davam edilir.")
+        return ""
+
+
+def safe_prefix(name):
+    """Fayl adi ucun tehlukesiz prefiks (Windows-da etibarsiz simvollar, rezerv adlar, uzun ad)"""
+    name = re.sub(r"[^\w\-.() ]+", "_", name.strip(), flags=re.UNICODE)
+    name = re.sub(r"\s+", "_", name).strip("._ ")[:60]
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+    if name.upper() in reserved:
+        name = "_" + name
+    return f"{name}_" if name else ""
+
+
+def pick_out_dir():
+    """Fayllar yazila bilen ilk qovluga yazilir: cari qovluq -> script qovlugu -> ev qovlugu"""
+    for d in (os.getcwd(), os.path.dirname(os.path.abspath(__file__)), os.path.expanduser("~")):
+        try:
+            p = os.path.join(d, ".write_test")
+            open(p, "w").close()
+            os.remove(p)
+            return d
+        except Exception:
+            continue
+    return os.getcwd()
+
+
 def main():
     global LOG, MON
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = input("Log/hesabat fayllari ucun ad (bos buraxa bilersen): ").strip()
-    name = re.sub(r'[\\/:*?"<>|\s]+', "_", name).strip("_")
-    prefix = f"{name}_" if name else ""
-    log_path = f"{prefix}lldp_description_log_{ts}.txt"
+    prefix = safe_prefix(ask_name("Log/hesabat fayllari ucun ad (bos buraxa bilersen): "))
+    out_dir = pick_out_dir()
+    log_path = os.path.join(out_dir, f"{prefix}lldp_description_log_{ts}.txt")
     LOG = open(log_path, "w", encoding="utf-8")
 
     ips = load_ips()
     if not ips:
         print("IP tapilmadi.")
+        wait_enter()
         return
     user = input("Username: ").strip()
     pw = getpass.getpass("Password: ")
@@ -495,17 +556,27 @@ def main():
     except (StopRequested, KeyboardInterrupt):
         out(f"\n{R}Istifadeci terefinden dayandirildi.{X}")
     finally:
-        out()
-        out(f"{B}{'=' * 78}{X}")
-        out(white(f"Execution log: {log_path}"))
-        if MON:
-            MON.done()
-        if want_xlsx:
-            save_xlsx(f"{prefix}lldp_description_report_{ts}.xlsx")
-        LOG.flush()
-        input("Press ENTER to exit.")
-        LOG.close()
+        try:
+            out()
+            out(f"{B}{'=' * 78}{X}")
+            out(white(f"Execution log: {log_path}"))
+            if MON:
+                MON.done()
+            if want_xlsx:
+                save_xlsx(os.path.join(out_dir, f"{prefix}lldp_description_report_{ts}.xlsx"))
+            LOG.flush()
+        except Exception as e:
+            print("Son emeliyyatlarda xeta:", e)
+        wait_enter()
+        try:
+            LOG.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        wait_enter()
